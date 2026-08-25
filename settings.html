@@ -502,6 +502,114 @@
                     </small>
                 </div>
             </div>
+
+            <hr>
+
+            <h4>
+                Reranker (second-pass ranking)
+            </h4>
+            <label class="checkbox_label" for="vectors_rerank_enabled" title="Over-fetch candidates with the embedding model, then re-rank them with a cross-encoder for much better precision.">
+                <input id="vectors_rerank_enabled" type="checkbox" class="checkbox">
+                <span>
+                    Enable Reranker
+                </span>
+            </label>
+            <div id="vectors_rerank_settings" class="marginTopBot5">
+                <label for="vectors_rerank_url">
+                    <small data-i18n="Reranker Endpoint URL">Reranker endpoint URL (/v1/rerank)</small>
+                </label>
+                <input id="vectors_rerank_url" class="text_pole" type="text" placeholder="http://127.0.0.1:8080" />
+                <div class="flex-container">
+                    <div class="flex1">
+                        <label for="vectors_rerank_model">
+                            <small data-i18n="Reranker Model">Model ID (optional)</small>
+                        </label>
+                        <input id="vectors_rerank_model" class="text_pole" type="text" placeholder="bge-reranker-v2-m3" />
+                    </div>
+                    <div class="flex1" title="How many candidates to over-fetch from vector search before reranking. Higher = safer recall, more CPU time. The per-path 'final count' settings decide how many survive.">
+                        <label for="vectors_rerank_recall">
+                            <small data-i18n="Recall Count">Recall count (wide fetch)</small>
+                        </label>
+                        <input id="vectors_rerank_recall" class="text_pole widthUnset" type="number" min="2" max="999" />
+                    </div>
+                </div>
+                <div class="flex-container">
+                    <div class="flex1" title="Optional API key, sent as a Bearer token. Leave empty for local servers.">
+                        <label for="vectors_rerank_key">
+                            <small data-i18n="API Key">API key (optional)</small>
+                        </label>
+                        <input id="vectors_rerank_key" class="text_pole" type="password" placeholder="(None)" />
+                    </div>
+                    <div class="flex1" title="The retrieval query can be very long. Truncate it to this many characters before sending to the reranker.">
+                        <label for="vectors_rerank_query_max_chars">
+                            <small data-i18n="Query Truncation">Query truncation (chars)</small>
+                        </label>
+                        <input id="vectors_rerank_query_max_chars" class="text_pole widthUnset" type="number" min="100" max="32000" step="100" />
+                    </div>
+                </div>
+                <label class="checkbox_label" for="vectors_rerank_ignore_threshold" title="Recommended: during the wide-recall phase, bypass the embedding score threshold entirely and let the reranker decide what matters.">
+                    <input id="vectors_rerank_ignore_threshold" type="checkbox" class="checkbox">
+                    <span>
+                        Ignore score threshold while recalling
+                    </span>
+                </label>
+                <div class="flex-container">
+                    <div id="vectors_rerank_test" class="menu_button menu_button_icon" title="Send a small test job to the reranker endpoint and show the returned scores.">
+                        <span>
+                            Test Reranker
+                        </span>
+                    </div>
+                </div>
+                <small>
+                    Local CPU example: <code>llama-server -m bge-reranker-v2-m3-Q8_0.gguf --reranking --port 8080</code>
+                </small>
+            </div>
+
+            <hr>
+
+            <h4>
+                Diagnostics
+            </h4>
+            <div class="flex-container alignitemscenter">
+                <span>Status:</span>
+                <span id="vectors_diag_status" class="rag-badge rag-badge-ok">(idle)</span>
+            </div>
+            <div class="flex-container">
+                <div id="vectors_run_diagnostics" class="menu_button menu_button_icon" title="Probe embedding query, reranker connectivity and chunk splitter integrity (including broken emoji detection).">
+                    <span>
+                        Run Diagnostics
+                    </span>
+                </div>
+                <div id="vectors_view_report" class="menu_button menu_button_icon" title="Show rank/score/status table of the most recent retrieval pass. Answers 'why was this recalled?'.">
+                    <span>
+                        Last Recall
+                    </span>
+                </div>
+                <div id="vectors_export_logs" class="menu_button menu_button_icon" title="Download the diagnostic ring buffer as a JSONL file.">
+                    <span>
+                        Export Logs
+                    </span>
+                </div>
+                <div id="vectors_clear_logs" class="menu_button menu_button_icon" title="Clear all diagnostic logs and the last recall report.">
+                    <span>
+                        Clear
+                    </span>
+                </div>
+            </div>
+            <label class="checkbox_label" for="vectors_debug_diff_threshold" title="Performs an extra query with threshold=0 on the chat path and lists which candidates were killed by the score threshold. Costs one additional vector query per generation.">
+                <input id="vectors_debug_diff_threshold" type="checkbox" class="checkbox">
+                <span>
+                    Show what the score threshold kills (extra query)
+                </span>
+            </label>
+            <select id="vectors_diag_filter" class="text_pole widthNatural">
+                <option value="all">All levels</option>
+                <option value="info">Info</option>
+                <option value="warn">Warnings</option>
+                <option value="error">Errors</option>
+            </select>
+            <div id="vectors_diag_log" class="rag-log-viewer"></div>
+            <div id="vectors_last_report" style="display: none;"></div>
         </div>
     </div>
 </div>

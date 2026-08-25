@@ -113,10 +113,246 @@ const settings = {
     enabled_world_info: false,
     enabled_for_all: false,
     max_entries: 5,
+
+    // For Reranker
+    rerank_enabled: false,
+    rerank_url: 'http://127.0.0.1:8080',
+    rerank_key: '',
+    rerank_model: 'bge-reranker-v2-m3',
+    rerank_recall: 30,
+    rerank_ignore_threshold: true,
+    rerank_query_max_chars: 2000,
+
+    // For Diagnostics
+    debug_enabled: true,
+    debug_diff_threshold: false,
 };
 
 const moduleWorker = new ModuleWorkerWrapper(synchronizeChat);
 const webllmProvider = new WebLlmVectorProvider();
+
+// ##################################################################################
+// ### Diagnostics: structured logging, recall reports, integrity checks          ###
+// ##################################################################################
+
+const RAG_LOG_MAX_ENTRIES = 200;
+const RAG_LOG_PREVIEW_LENGTH = 160;
+const LONE_SURROGATE_REGEX = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
+/**
+ * Ring buffer of diagnostic log entries. Persisted (debounced) into extension settings.
+ * @type {{ ts: number, level: string, type: string, message: string, data?: any }[]}
+ */
+const ragLogEntries = [];
+
+/** Last recall report, also persisted so it survives page reloads. */
+let lastRecallReport = null;
+
+const saveRagLogDebounced = debounce(() => {
+    if (!extension_settings.vectors) {
+        return;
+    }
+    extension_settings.vectors.debug_log = ragLogEntries.slice(-RAG_LOG_MAX_ENTRIES);
+    extension_settings.vectors.debug_last_report = lastRecallReport;
+    saveSettingsDebounced();
+}, 2000);
+
+/**
+ * Updates the status badge shown in the diagnostics panel.
+ * @param {string} text Badge text
+ * @param {string} level One of 'info', 'warn', 'error'
+ */
+function updateStatusBadge(text, level = 'info') {
+    const badge = $('#vectors_diag_status');
+    if (!badge.length) {
+        return;
+    }
+    badge.text(text);
+    badge.toggleClass('rag-badge-ok', level === 'info');
+    badge.toggleClass('rag-badge-warn', level === 'warn');
+    badge.toggleClass('rag-badge-err', level === 'error');
+}
+
+/**
+ * Records a structured diagnostic event.
+ * @param {string} type Event type ('vectorize'|'query'|'rerank'|'inject'|'system')
+ * @param {string} level 'info'|'warn'|'error'
+ * @param {string} message Human readable summary
+ * @param {any} [data] Optional structured payload
+ */
+function ragLogEvent(type, level, message, data) {
+    const entry = { ts: Date.now(), level, type, message, ...(data !== undefined ? { data } : {}) };
+    ragLogEntries.push(entry);
+    if (ragLogEntries.length > RAG_LOG_MAX_ENTRIES) {
+        ragLogEntries.splice(0, ragLogEntries.length - RAG_LOG_MAX_ENTRIES);
+    }
+
+    const consoleArgs = [`Vectors[${type}]: ${message}`];
+    if (data !== undefined) {
+        consoleArgs.push(data);
+    }
+    switch (level) {
+        case 'warn':
+            console.warn(...consoleArgs);
+            break;
+        case 'error':
+            console.error(...consoleArgs);
+            break;
+        default:
+            console.log(...consoleArgs);
+            break;
+    }
+
+    renderRagLog();
+    saveRagLogDebounced();
+}
+
+/**
+ * Renders the log viewer and last report table in the settings panel (if present).
+ */
+function renderRagLog() {
+    const viewer = $('#vectors_diag_log');
+    if (!viewer.length) {
+        return;
+    }
+    const filterLevel = String($('#vectors_diag_filter').val() || 'all');
+    const rows = ragLogEntries
+        .filter(x => filterLevel === 'all' || x.level === filterLevel)
+        .slice(-100)
+        .reverse()
+        .map(x => {
+            const time = new Date(x.ts).toLocaleTimeString();
+            const detail = x.data ? `<span class="rag-log-detail">${escapeHtml(JSON.stringify(x.data))}</span>` : '';
+            return `<div class="rag-log-line rag-log-${x.level}"><span class="rag-log-time">${time}</span> <span class="rag-log-type">[${escapeHtml(x.type)}]</span> ${escapeHtml(x.message)} ${detail}</div>`;
+        });
+    viewer.html(rows.join('') || '<div class="rag-log-line">(no log entries)</div>');
+}
+
+/**
+ * Stores and renders a recall report of the most recent retrieval pass.
+ * @param {object} report Recall report
+ */
+function recordRecallReport(report) {
+    lastRecallReport = report;
+    updateStatusBadge(`✓ ${report.finalCount ?? 0} injected (${report.tookMs ?? '?'}ms)`, 'info');
+    ragLogEvent(report.path, 'info', `Recall: ${report.candidates?.length ?? 0} candidates -> ${report.finalCount ?? 0} final` +
+        `${report.reranked ? ' [reranked]' : ''}`, {
+        topK: report.topK,
+        threshold: report.threshold,
+        tookMs: report.tookMs,
+    });
+    renderLastReport();
+    saveRagLogDebounced();
+}
+
+/**
+ * Marks a failed interception in the diagnostics UI.
+ * @param {string} path Retrieval path that failed
+ * @param {unknown} error Error object
+ */
+function recordRecallError(path, error) {
+    updateStatusBadge(`✗ ${path} failed`, 'error');
+    ragLogEvent(path, 'error', `Retrieval failed: ${error?.message || error}`);
+}
+
+/**
+ * Renders the "last recall" table into the diagnostics panel.
+ */
+function renderLastReport() {
+    const container = $('#vectors_last_report');
+    if (!container.length) {
+        return;
+    }
+    if (!lastRecallReport) {
+        container.html('<small>(no retrieval recorded yet)</small>');
+        return;
+    }
+
+    const r = lastRecallReport;
+    const head = `<div class="rag-report-meta">path=<b>${escapeHtml(r.path)}</b> | topK=${r.topK} | threshold=${r.threshold}` +
+        ` | reranked=${r.reranked ? 'yes' : 'no'} | took=${r.tookMs}ms</div>` +
+        `<div class="rag-report-meta">query: ${escapeHtml(String(r.queryPreview || '').slice(0, 300))}</div>`;
+
+    const killed = r.filteredByThreshold || [];
+    const killedRows = killed.map(k =>
+        `<div class="rag-report-killed">[killed by threshold] ${escapeHtml(k)}</div>`).join('');
+
+    const rows = (r.candidates || []).map(c => {
+        const status = c.inserted ? '<b style="color:var(--okGreen)">INSERTED</b>' : `cut (${c.reason})`;
+        return `<tr><td>${c.rank}</td><td>${escapeHtml(String(c.rerankScore ?? '-'))}</td><td>${status}</td><td class="rag-report-text">${escapeHtml(c.text)}</td></tr>`;
+    }).join('');
+    const table = rows
+        ? `<table class="rag-report-table"><thead><tr><th>#</th><th>rerank</th><th>status</th><th>text preview</th></tr></thead><tbody>${rows}</tbody></table>`
+        : '<small>(no candidates returned)</small>';
+
+    container.html(head + killedRows + table);
+}
+
+/**
+ * Validates chunk texts before they are vectorized. Detection only - never mutates data.
+ * Flags lone surrogate pairs (broken emoji), empty chunks, tiny chunks and duplicate hashes.
+ * @param {string[]} chunks Chunk texts
+ * @param {string} sourceName Human readable source description for warnings
+ * @returns {boolean} True if no hard problems were found
+ */
+function validateChunks(chunks, sourceName) {
+    const problems = [];
+    /** @type {Map<number, number>} */
+    const seenHashes = new Map();
+
+    chunks.forEach((rawChunk, index) => {
+        const chunk = String(rawChunk);
+        if (!chunk.trim()) {
+            problems.push({ index, reason: 'empty chunk' });
+            return;
+        }
+        if (LONE_SURROGATE_REGEX.test(chunk)) {
+            problems.push({ index, reason: 'lone surrogate pair (broken emoji?)', preview: chunk.slice(0, 80) });
+        }
+        if (index > 0 && chunk.trim().length < 8) {
+            problems.push({ index, reason: 'suspiciously tiny chunk', preview: chunk.slice(0, 40) });
+        }
+        const hash = getStringHash(chunk);
+        if (seenHashes.has(hash)) {
+            problems.push({ index, reason: `duplicate hash with chunk #${seenHashes.get(hash)} (identical content)` });
+        } else {
+            seenHashes.set(hash, index);
+        }
+    });
+
+    if (problems.length > 0) {
+        toastr.warning(`Found ${problems.length} suspicious chunk(s) in "${sourceName}". Details in the Diagnostics panel.`, 'Vector Storage', { timeOut: 8000 });
+        for (const problem of problems) {
+            ragLogEvent('vectorize', 'warn', `Chunk problem in "${sourceName}" #${problem.index}: ${problem.reason}`, problem.preview ? { preview: problem.preview } : undefined);
+        }
+        return false;
+    }
+
+    return true;
+}
+
+/**
+ * Verifies that the number of stored hashes matches what was just ingested.
+ * Catches silent insertion drops.
+ * @param {string} collectionId Collection ID
+ * @param {number} expectedDelta Expected number of newly stored items
+ * @param {number} countBefore Saved-hash count before ingestion
+ * @param {string} sourceName Source description for logs
+ */
+async function verifyInsertionCount(collectionId, expectedDelta, countBefore, sourceName) {
+    try {
+        const savedHashes = await getSavedHashes(collectionId);
+        const delta = savedHashes.length - countBefore;
+        if (delta !== expectedDelta) {
+            toastr.warning(`Stored ${delta}/${expectedDelta} chunks for "${sourceName}". Some items may have been dropped silently!`, 'Vector Storage');
+            ragLogEvent('vectorize', 'warn', `Insertion mismatch for "${sourceName}": expected ${expectedDelta}, stored ${delta}`, { collectionId });
+        } else {
+            ragLogEvent('vectorize', 'info', `Verified ${delta}/${expectedDelta} chunks stored for "${sourceName}"`);
+        }
+    } catch (error) {
+        ragLogEvent('vectorize', 'warn', `Could not verify insertion for "${sourceName}"`, { error: String(error?.message || error) });
+    }
+}
 const cachedSummaries = new Map();
 const vectorApiRequiresUrl = ['llamacpp', 'vllm', 'ollama', 'koboldcpp'];
 
@@ -210,6 +446,7 @@ function getChunkDelimiters() {
  */
 function splitByChunks(items) {
     if (settings.message_chunk_size <= 0) {
+        validateChunks(items.map(x => x.text), 'chat messages');
         return items;
     }
 
@@ -217,6 +454,7 @@ function splitByChunks(items) {
 
     for (const item of items) {
         const chunks = splitRecursive(item.text, settings.message_chunk_size, getChunkDelimiters());
+        validateChunks(chunks, `chat message #${item.index}`);
         for (const chunk of chunks) {
             const chunkedItem = { ...item, text: chunk };
             chunkedItems.push(chunkedItem);
@@ -537,17 +775,61 @@ async function ingestDataBankAttachments(source) {
  */
 async function injectDataBankChunks(queryText, collectionIds) {
     try {
-        const queryResults = await queryMultipleCollections(collectionIds, queryText, settings.chunk_count_db, settings.score_threshold);
+        const { topK: recallTopK, threshold: recallThreshold } = getRecallParams(settings.chunk_count_db);
+        const startedAt = Date.now();
+        const queryResults = await queryMultipleCollections(collectionIds, queryText, recallTopK, recallThreshold);
         console.debug(`Vectors: Retrieved ${collectionIds.length} Data Bank collections`, queryResults);
-        let textResult = '';
 
+        // Pool chunks from every collection (document order kept inside each collection)
+        const pooledTexts = [];
         for (const collectionId in queryResults) {
             console.debug(`Vectors: Processing Data Bank collection ${collectionId}`, queryResults[collectionId]);
             const metadata = queryResults[collectionId].metadata?.filter(x => x.text)?.sort((a, b) => a.index - b.index)?.map(x => x.text)?.filter(onlyUnique) || [];
-            textResult += metadata.join('\n') + '\n\n';
+
+            if (shouldRerank()) {
+                for (const text of metadata) {
+                    if (!pooledTexts.includes(text)) {
+                        pooledTexts.push(text);
+                    }
+                }
+            } else {
+                pooledTexts.push(metadata.join('\n') + '\n\n');
+            }
         }
 
-        if (!textResult) {
+        let textResult;
+        let finalCandidates = [];
+
+        if (shouldRerank()) {
+            // Rerank the whole pooled candidate set, then keep only the final count
+            const rerankedOrder = await rerankTexts(queryText, pooledTexts);
+            finalCandidates = rerankedOrder.map((entry, rank) => ({
+                rank: rank,
+                rerankScore: entry.score,
+                inserted: rank < settings.chunk_count_db,
+                reason: rank < settings.chunk_count_db ? '' : 'final count cut',
+                text: String(pooledTexts[entry.index] ?? '').slice(0, RAG_LOG_PREVIEW_LENGTH),
+            }));
+            textResult = rerankedOrder.slice(0, settings.chunk_count_db).map(x => pooledTexts[x.index]).join('\n') + '\n\n';
+        } else {
+            finalCandidates = pooledTexts.map((text, rank) => ({ rank: rank, rerankScore: null, inserted: true, reason: '', text: String(text).slice(0, RAG_LOG_PREVIEW_LENGTH) }));
+            textResult = pooledTexts.join('');
+        }
+
+        recordRecallReport({
+            ts: Date.now(),
+            path: 'data_bank',
+            queryPreview: queryText,
+            topK: recallTopK,
+            threshold: recallThreshold ?? settings.score_threshold,
+            reranked: shouldRerank(),
+            tookMs: Date.now() - startedAt,
+            finalCount: finalCandidates.filter(x => x.inserted).length,
+            filteredByThreshold: [],
+            candidates: finalCandidates,
+        });
+
+        if (!textResult || !textResult.trim()) {
             console.debug('Vectors: No Data Bank chunks found');
             return;
         }
@@ -555,6 +837,7 @@ async function injectDataBankChunks(queryText, collectionIds) {
         const insertedText = substituteParamsExtended(settings.file_template_db, { text: textResult });
         setExtensionPrompt(EXTENSION_PROMPT_TAG_DB, insertedText, settings.file_position_db, settings.file_depth_db, settings.include_wi, settings.file_depth_role_db);
     } catch (error) {
+        recordRecallError('data_bank', error);
         console.error('Vectors: Failed to insert Data Bank chunks', error);
     }
 }
@@ -567,10 +850,42 @@ async function injectDataBankChunks(queryText, collectionIds) {
  */
 async function retrieveFileChunks(queryText, collectionId) {
     console.debug(`Vectors: Retrieving file chunks for collection ${collectionId}`, queryText);
-    const queryResults = await queryCollection(collectionId, queryText, settings.chunk_count);
+    const { topK: recallTopK, threshold: recallThreshold } = getRecallParams(settings.chunk_count);
+    const startedAt = Date.now();
+    const queryResults = await queryCollection(collectionId, queryText, recallTopK, recallThreshold);
     console.debug(`Vectors: Retrieved ${queryResults.hashes.length} file chunks for collection ${collectionId}`, queryResults);
     const metadata = queryResults.metadata.filter(x => x.text).sort((a, b) => a.index - b.index).map(x => x.text).filter(onlyUnique);
-    const fileText = metadata.join('\n');
+
+    let fileText;
+    let finalCandidates;
+
+    if (shouldRerank()) {
+        const rerankedOrder = await rerankTexts(queryText, metadata);
+        finalCandidates = rerankedOrder.map((entry, rank) => ({
+            rank: rank,
+            rerankScore: entry.score,
+            inserted: rank < settings.chunk_count,
+            reason: rank < settings.chunk_count ? '' : 'final count cut',
+            text: String(metadata[entry.index] ?? '').slice(0, RAG_LOG_PREVIEW_LENGTH),
+        }));
+        fileText = rerankedOrder.slice(0, settings.chunk_count).map(x => metadata[x.index]).join('\n');
+    } else {
+        finalCandidates = metadata.map((text, rank) => ({ rank: rank, rerankScore: null, inserted: true, reason: '', text: String(text).slice(0, RAG_LOG_PREVIEW_LENGTH) }));
+        fileText = metadata.join('\n');
+    }
+
+    recordRecallReport({
+        ts: Date.now(),
+        path: 'file',
+        queryPreview: queryText,
+        topK: recallTopK,
+        threshold: recallThreshold ?? settings.score_threshold,
+        reranked: shouldRerank(),
+        tookMs: Date.now() - startedAt,
+        finalCount: finalCandidates.filter(x => x.inserted).length,
+        filteredByThreshold: [],
+        candidates: finalCandidates,
+    });
 
     return fileText;
 }
@@ -607,13 +922,28 @@ async function vectorizeFile(fileText, fileName, collectionId, chunkSize, overla
             : splitRecursive(fileText, chunkSize, delimiters).map(applyOverlap);
         console.debug(`Vectors: Split file ${fileName} into ${chunks.length} chunks with ${overlapPercent}% overlap`, chunks);
 
+        // Integrity check: broken emoji (lone surrogates), empty/tiny/duplicate chunks.
+        // Detection only - the data is left untouched, cleaning stays upstream.
+        validateChunks(chunks, fileName);
+        ragLogEvent('vectorize', 'info', `Vectorizing "${fileName}": ${chunks.length} chunks`, { collectionId, overlapPercent, chunkSize });
+
         const items = chunks.map((chunk, index) => ({ hash: getStringHash(chunk), text: chunk, index: index }));
+
+        let savedHashesBefore = 0;
+        try {
+            savedHashesBefore = (await getSavedHashes(collectionId)).length;
+        } catch {
+            // Non-fatal: collection may not exist yet
+        }
 
         for (let i = 0; i < items.length; i += batchSize) {
             toastBody.text(`${i}/${items.length} (${Math.round((i / items.length) * 100)}%) chunks processed`);
             const chunkedBatch = items.slice(i, i + batchSize);
             await insertVectorItems(collectionId, chunkedBatch);
         }
+
+        // Post-insert verification: catches silent insertion drops
+        await verifyInsertionCount(collectionId, items.length, savedHashesBefore, fileName);
 
         toastr.clear(toast);
         console.log(`Vectors: Inserted ${chunks.length} vector items for file ${fileName} into ${collectionId}`);
@@ -675,27 +1005,106 @@ async function rearrangeChat(chat, _contextSize, _abort, type) {
             return;
         }
 
+        // Wide-recall parameters: over-fetch and optionally ignore the embedding threshold,
+        // letting the reranker make the final decision ("wide entry, strict exit").
+        const { topK: recallTopK, threshold: recallThreshold } = getRecallParams(settings.insert);
+        const startedAt = Date.now();
+
         // Get the most relevant messages, excluding the last few
-        const queryResults = await queryCollection(chatId, queryText, settings.insert);
-        const queryHashes = queryResults.hashes.filter(onlyUnique);
-        const queriedMessages = [];
-        const insertedHashes = new Set();
+        const queryResults = await queryCollection(chatId, queryText, recallTopK, recallThreshold);
+
+        // Fix: derive hashes from metadata (which IS filtered server-side by score threshold),
+        // otherwise the score threshold silently has no effect on the chat path.
+        const queryHashes = (queryResults.metadata || []).map(x => Number(x.hash)).filter(onlyUnique);
         const retainMessages = chat.slice(-settings.protect);
+
+        // Collect candidate messages in chat order (first occurrence of each hash wins)
+        const candidateMessages = [];
+        const seenCandidateHashes = new Set();
 
         for (const message of chat) {
             if (retainMessages.includes(message) || !message.mes) {
                 continue;
             }
             const hash = getStringHash(substituteParams(message.mes));
-            if (queryHashes.includes(hash) && !insertedHashes.has(hash)) {
-                queriedMessages.push(message);
-                insertedHashes.add(hash);
+            if (queryHashes.includes(hash) && !seenCandidateHashes.has(hash)) {
+                candidateMessages.push({ message: message, hash: hash });
+                seenCandidateHashes.add(hash);
             }
         }
 
-        // Rearrange queried messages to match query order
-        // Order is reversed because more relevant are at the lower indices
-        queriedMessages.sort((a, b) => queryHashes.indexOf(getStringHash(substituteParams(b.mes))) - queryHashes.indexOf(getStringHash(substituteParams(a.mes))));
+        // Optional diagnostics: figure out what the score threshold has killed
+        let killedByThreshold = [];
+        if (settings.debug_enabled && settings.debug_diff_threshold && recallThreshold !== 0) {
+            try {
+                const unfilteredResults = await queryCollection(chatId, queryText, recallTopK, 0);
+                const unfilteredHashes = new Set((unfilteredResults.metadata || []).map(x => Number(x.hash)));
+                const seenKilledHashes = new Set();
+
+                for (const message of chat) {
+                    if (retainMessages.includes(message) || !message.mes) {
+                        continue;
+                    }
+                    const hash = getStringHash(substituteParams(message.mes));
+                    // Present in the unfiltered result set, but rejected by the score threshold
+                    if (unfilteredHashes.has(hash) && !queryHashes.includes(hash) && !seenKilledHashes.has(hash)) {
+                        seenKilledHashes.add(hash);
+                        killedByThreshold.push(collapseNewlines(String(message.mes)).trim().slice(0, RAG_LOG_PREVIEW_LENGTH));
+                    }
+                }
+                ragLogEvent('query', 'info', `Threshold debug: ${killedByThreshold.length} candidate(s) killed by score threshold`, { count: killedByThreshold.length });
+            } catch (error) {
+                ragLogEvent('query', 'warn', 'Threshold diff query failed', { error: String(error?.message || error) });
+            }
+        }
+
+        // Rerank candidates against the query, then keep only the final count
+        const rerankedOrder = await rerankTexts(queryText, candidateMessages.map(c => collapseNewlines(String(c.message.mes)).trim()));
+        const rankedCandidates = rerankedOrder.map((entry, rank) => ({
+            ...candidateMessages[entry.index],
+            rerankScore: entry.score,
+            rank: rank,
+        }));
+        const finalCandidates = rankedCandidates.slice(0, settings.insert);
+        const insertedHashes = new Set(finalCandidates.map(c => c.hash));
+
+        const queriedMessages = [];
+        for (const message of chat) {
+            if (!message.mes) {
+                continue;
+            }
+            const hash = getStringHash(substituteParams(message.mes));
+            if (insertedHashes.has(hash) && !queriedMessages.includes(message)) {
+                queriedMessages.push(message);
+            }
+        }
+
+        // Rearrange queried messages to match relevance order
+        // Order is reversed because more relevant are at the lower ranks
+        queriedMessages.sort((a, b) => {
+            const rankA = rankedCandidates.find(x => x.message === a)?.rank ?? 0;
+            const rankB = rankedCandidates.find(x => x.message === b)?.rank ?? 0;
+            return rankB - rankA;
+        });
+
+        recordRecallReport({
+            ts: Date.now(),
+            path: 'chat',
+            queryPreview: queryText,
+            topK: recallTopK,
+            threshold: recallThreshold ?? settings.score_threshold,
+            reranked: shouldRerank(),
+            tookMs: Date.now() - startedAt,
+            finalCount: queriedMessages.length,
+            filteredByThreshold: killedByThreshold,
+            candidates: rankedCandidates.map(c => ({
+                rank: c.rank,
+                rerankScore: c.rerankScore,
+                inserted: insertedHashes.has(c.hash),
+                reason: insertedHashes.has(c.hash) ? '' : 'final count cut',
+                text: collapseNewlines(String(c.message.mes)).trim().slice(0, RAG_LOG_PREVIEW_LENGTH),
+            })),
+        });
 
         // Remove queried messages from the original chat array
         for (const message of chat) {
@@ -713,6 +1122,7 @@ async function rearrangeChat(chat, _contextSize, _abort, type) {
         const insertedText = getPromptText(queriedMessages);
         setExtensionPrompt(EXTENSION_PROMPT_TAG, insertedText, settings.position, settings.depth, settings.include_wi);
     } catch (error) {
+        recordRecallError('chat', error);
         toastr.error('Generation interceptor aborted. Check browser console for more details.', 'Vector Storage');
         console.error('Vectors: Failed to rearrange chat', error);
     }
@@ -992,9 +1402,10 @@ async function deleteVectorItems(collectionId, hashes) {
  * @param {string} collectionId - The collection to query
  * @param {string} searchText - The text to query
  * @param {number} topK - The number of results to return
+ * @param {number} [thresholdOverride] - Optional score threshold override
  * @returns {Promise<{ hashes: number[], metadata: object[]}>} - Hashes of the results
  */
-async function queryCollection(collectionId, searchText, topK) {
+async function queryCollection(collectionId, searchText, topK, thresholdOverride) {
     const args = await getAdditionalArgs([searchText]);
     const response = await fetch('/api/vector/query', {
         method: 'POST',
@@ -1005,7 +1416,7 @@ async function queryCollection(collectionId, searchText, topK) {
             searchText: searchText,
             topK: topK,
             source: settings.source,
-            threshold: settings.score_threshold,
+            threshold: thresholdOverride ?? settings.score_threshold,
         }),
     });
 
@@ -1044,6 +1455,131 @@ async function queryMultipleCollections(collectionIds, searchText, topK, thresho
     }
 
     return await response.json();
+}
+
+/**
+ * Returns true when the reranker should be applied to retrieval results.
+ * @returns {boolean}
+ */
+function shouldRerank() {
+    return !!settings.rerank_enabled;
+}
+
+/**
+ * Gets the recall parameters for a retrieval path when the reranker is active.
+ * @param {number} finalCount Final number of results wanted after reranking
+ * @returns {{ topK: number, threshold?: number }} Recall query parameters
+ */
+function getRecallParams(finalCount) {
+    if (!shouldRerank()) {
+        return { topK: finalCount };
+    }
+    const recall = Math.max(Number(settings.rerank_recall) || 30, finalCount);
+    const threshold = settings.rerank_ignore_threshold ? 0 : undefined;
+    return { topK: recall, threshold };
+}
+
+let rerankWarnedOnce = false;
+
+/**
+ * Reranks candidate texts against a query using an external /v1/rerank endpoint
+ * (llama.cpp server style; also compatible with TEI/Jina-style responses).
+ * Falls back to the original order on any failure.
+ * @param {string} queryText Query text
+ * @param {string[]} texts Candidate texts (index-mapped)
+ * @param {boolean} [force] Bypass the global enable switch (used by the connection test)
+ * @returns {Promise<{ index: number, score: number | null }[]>} Candidates ordered by relevance
+ */
+async function rerankTexts(queryText, texts, force = false) {
+    const originalOrder = texts.map((_, index) => ({ index, score: null }));
+    if ((!shouldRerank() && !force) || texts.length <= 1) {
+        return originalOrder;
+    }
+
+    const baseUrl = String(settings.rerank_url || '').trim().replace(/\/+$/, '');
+    if (!baseUrl) {
+        return originalOrder;
+    }
+
+    const maxChars = Number(settings.rerank_query_max_chars);
+    const trimmedQuery = Number.isFinite(maxChars) && maxChars > 0 && queryText.length > maxChars
+        ? `${queryText.slice(0, maxChars)}…`
+        : queryText;
+
+    /** @type {Record<string, string>} */
+    const headers = { 'Content-Type': 'application/json' };
+    const apiKey = String(settings.rerank_key || '').trim();
+    if (apiKey) {
+        headers['Authorization'] = `Bearer ${apiKey}`;
+    }
+
+    const startedAt = Date.now();
+    try {
+        const response = await fetch(`${baseUrl}/v1/rerank`, {
+            method: 'POST',
+            headers: headers,
+            body: JSON.stringify({
+                model: String(settings.rerank_model || '').trim(),
+                query: trimmedQuery,
+                documents: texts,
+                top_n: texts.length,
+            }),
+        });
+
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status} ${response.statusText}`);
+        }
+
+        const data = await response.json();
+        const results = Array.isArray(data?.results) ? data.results : [];
+        if (!results.length) {
+            throw new Error('empty results');
+        }
+
+        const scored = results
+            .map(x => ({ index: Number(x.index), score: Number(x.relevance_score ?? x.score ?? 0) }))
+            .filter(x => Number.isInteger(x.index) && x.index >= 0 && x.index < texts.length);
+
+        // Append anything the API skipped, preserving the original order at the end
+        const seen = new Set(scored.map(x => x.index));
+        for (let index = 0; index < texts.length; index++) {
+            if (!seen.has(index)) {
+                scored.push({ index: index, score: null });
+            }
+        }
+
+        ragLogEvent('rerank', 'info', `Reranked ${texts.length} docs in ${Date.now() - startedAt}ms`, { topScore: scored[0]?.score });
+        rerankWarnedOnce = false;
+        return scored;
+    } catch (error) {
+        console.error('Vectors: Reranker failed, falling back to vector order', error);
+        ragLogEvent('rerank', 'warn', `Reranker failed: ${error?.message || error}. Falling back to vector order.`);
+        if (!rerankWarnedOnce) {
+            toastr.warning(`Reranker failed (${error?.message || error}). Using embedding order instead.`, 'Vector Storage');
+            rerankWarnedOnce = true;
+        }
+        return originalOrder;
+    }
+}
+
+/**
+ * Runs a quick connectivity test against the configured reranker endpoint.
+ * @returns {Promise<{ ok: boolean, message: string, ms: number }>}
+ */
+async function testRerankerConnection() {
+    const startedAt = Date.now();
+    try {
+        const ordered = await rerankTexts('What is the capital of France?', [
+            'The capital of France is Paris.',
+            'Bananas are rich in potassium.',
+            'The Eiffel Tower is located in Paris.',
+        ], true);
+        const ms = Date.now() - startedAt;
+        const topText = ordered[0]?.score !== null ? `top score ${ordered[0].score.toFixed(3)}` : 'no scores returned';
+        return { ok: ordered[0]?.score !== null, message: `Reranker responded in ${ms}ms (${topText})`, ms };
+    } catch (error) {
+        return { ok: false, message: `Reranker test failed: ${error?.message || error}`, ms: Date.now() - startedAt };
+    }
 }
 
 /**
@@ -1139,6 +1675,7 @@ function toggleSettings() {
     $('#vectors_files_settings').toggle(!!settings.enabled_files);
     $('#vectors_chats_settings').toggle(!!settings.enabled_chats);
     $('#vectors_world_info_settings').toggle(!!settings.enabled_world_info);
+    $('#vectors_rerank_settings').toggle(!!settings.rerank_enabled);
     $('#together_vectorsModel').toggle(settings.source === 'togetherai');
     $('#openai_vectorsModel').toggle(settings.source === 'openai');
     $('#electronhub_vectorsModel').toggle(settings.source === 'electronhub');
@@ -1682,8 +2219,56 @@ async function activateWorldInfo(chat) {
         return;
     }
 
-    const queryResults = await queryMultipleCollections(collectionIds, queryText, settings.max_entries, settings.score_threshold);
-    const activatedHashes = Object.values(queryResults).flatMap(x => x.hashes).filter(onlyUnique);
+    const { topK: recallTopK, threshold: recallThreshold } = getRecallParams(settings.max_entries);
+    const startedAt = Date.now();
+    const queryResults = await queryMultipleCollections(collectionIds, queryText, recallTopK, recallThreshold);
+
+    /** @type {number[]} */
+    let activatedHashes;
+    /** @type {{ rank: number, rerankScore: number | null, inserted: boolean, reason: string, text: string }[]} */
+    let reportCandidates;
+
+    if (shouldRerank()) {
+        // Pool candidate texts across collections, keyed by hash to avoid duplicates
+        const pooledHashes = [];
+        const pooledTexts = [];
+        for (const collectionId in queryResults) {
+            for (const item of (queryResults[collectionId].metadata || [])) {
+                const hash = Number(item.hash);
+                if (!pooledHashes.includes(hash)) {
+                    pooledHashes.push(hash);
+                    pooledTexts.push(String(item.text ?? ''));
+                }
+            }
+        }
+
+        const rerankedOrder = await rerankTexts(queryText, pooledTexts);
+        reportCandidates = rerankedOrder.map((entry, rank) => ({
+            rank: rank,
+            rerankScore: entry.score,
+            inserted: rank < settings.max_entries,
+            reason: rank < settings.max_entries ? '' : 'final count cut',
+            text: String(pooledTexts[entry.index] ?? '').slice(0, RAG_LOG_PREVIEW_LENGTH),
+        }));
+        activatedHashes = rerankedOrder.slice(0, settings.max_entries).map(entry => pooledHashes[entry.index]);
+    } else {
+        activatedHashes = Object.values(queryResults).flatMap(x => x.hashes).filter(onlyUnique);
+        reportCandidates = [];
+    }
+
+    recordRecallReport({
+        ts: Date.now(),
+        path: 'world_info',
+        queryPreview: queryText,
+        topK: recallTopK,
+        threshold: recallThreshold ?? settings.score_threshold,
+        reranked: shouldRerank(),
+        tookMs: Date.now() - startedAt,
+        finalCount: Math.min(activatedHashes.length, shouldRerank() ? settings.max_entries : activatedHashes.length),
+        filteredByThreshold: [],
+        candidates: reportCandidates,
+    });
+
     const activatedEntries = [];
 
     // Activate entries found in the query results
@@ -1718,6 +2303,13 @@ jQuery(async () => {
 
     // Migrate from TensorFlow to Transformers
     settings.source = settings.source !== 'local' ? settings.source : 'transformers';
+
+    // Restore diagnostics state (log ring buffer + last recall report)
+    if (Array.isArray(extension_settings.vectors.debug_log)) {
+        ragLogEntries.push(...extension_settings.vectors.debug_log.slice(-RAG_LOG_MAX_ENTRIES));
+    }
+    lastRecallReport = extension_settings.vectors.debug_last_report || null;
+
     const template = await renderExtensionTemplateAsync(MODULE_NAME, 'settings');
     $('#vectors_container').append(template);
     $('#vectors_enabled_chats').prop('checked', settings.enabled_chats).on('input', () => {
@@ -1980,6 +2572,151 @@ jQuery(async () => {
         saveSettingsDebounced();
     });
 
+    // ============================= Reranker settings =============================
+
+    $('#vectors_rerank_enabled').prop('checked', settings.rerank_enabled).on('input', () => {
+        settings.rerank_enabled = !!$('#vectors_rerank_enabled').prop('checked');
+        Object.assign(extension_settings.vectors, settings);
+        saveSettingsDebounced();
+        toggleSettings();
+    });
+    $('#vectors_rerank_url').val(settings.rerank_url).on('change', () => {
+        settings.rerank_url = String($('#vectors_rerank_url').val());
+        Object.assign(extension_settings.vectors, settings);
+        saveSettingsDebounced();
+    });
+    $('#vectors_rerank_key').val(settings.rerank_key).on('change', () => {
+        settings.rerank_key = String($('#vectors_rerank_key').val());
+        Object.assign(extension_settings.vectors, settings);
+        saveSettingsDebounced();
+    });
+    $('#vectors_rerank_model').val(settings.rerank_model).on('change', () => {
+        settings.rerank_model = String($('#vectors_rerank_model').val());
+        Object.assign(extension_settings.vectors, settings);
+        saveSettingsDebounced();
+    });
+    $('#vectors_rerank_recall').val(settings.rerank_recall).on('input', () => {
+        settings.rerank_recall = Number($('#vectors_rerank_recall').val());
+        Object.assign(extension_settings.vectors, settings);
+        saveSettingsDebounced();
+    });
+    $('#vectors_rerank_ignore_threshold').prop('checked', settings.rerank_ignore_threshold).on('input', () => {
+        settings.rerank_ignore_threshold = !!$('#vectors_rerank_ignore_threshold').prop('checked');
+        Object.assign(extension_settings.vectors, settings);
+        saveSettingsDebounced();
+    });
+    $('#vectors_rerank_query_max_chars').val(settings.rerank_query_max_chars).on('input', () => {
+        settings.rerank_query_max_chars = Number($('#vectors_rerank_query_max_chars').val());
+        Object.assign(extension_settings.vectors, settings);
+        saveSettingsDebounced();
+    });
+    $('#vectors_rerank_test').on('click', async () => {
+        const button = $('#vectors_rerank_test');
+        button.addClass('busy');
+        try {
+            const result = await testRerankerConnection();
+            if (result.ok) {
+                toastr.success(result.message, 'Reranker Test');
+                ragLogEvent('rerank', 'info', `Connection test OK`, { ms: result.ms });
+            } else {
+                toastr.error(result.message, 'Reranker Test');
+                ragLogEvent('rerank', 'error', `Connection test failed: ${result.message}`);
+            }
+        } finally {
+            button.removeClass('busy');
+        }
+    });
+
+    // ============================== Diagnostics =================================
+
+    $('#vectors_debug_diff_threshold').prop('checked', settings.debug_diff_threshold).on('input', () => {
+        settings.debug_diff_threshold = !!$('#vectors_debug_diff_threshold').prop('checked');
+        Object.assign(extension_settings.vectors, settings);
+        saveSettingsDebounced();
+    });
+    $('#vectors_diag_filter').on('change', renderRagLog);
+    $('#vectors_view_report').on('click', () => {
+        renderLastReport();
+        $('#vectors_last_report').toggle();
+    });
+    $('#vectors_export_logs').on('click', () => {
+        const lines = ragLogEntries.map(x => JSON.stringify(x)).join('\n');
+        const blob = new Blob([lines || '[]'], { type: 'application/x-ndjson' });
+        const url = URL.createObjectURL(blob);
+        const anchor = document.createElement('a');
+        anchor.href = url;
+        anchor.download = `vectors-debug-${new Date().toISOString().replace(/[:.]/g, '-')}.jsonl`;
+        anchor.click();
+        URL.revokeObjectURL(url);
+    });
+    $('#vectors_clear_logs').on('click', () => {
+        ragLogEntries.length = 0;
+        lastRecallReport = null;
+        extension_settings.vectors.debug_log = [];
+        extension_settings.vectors.debug_last_report = null;
+        saveSettingsDebounced();
+        renderRagLog();
+        renderLastReport();
+        updateStatusBadge('(idle)', 'info');
+    });
+    $('#vectors_run_diagnostics').on('click', async () => {
+        const button = $('#vectors_run_diagnostics');
+        button.addClass('busy');
+        updateStatusBadge('…running diagnostics', 'warn');
+
+        /** @type {{ name: string, ok: boolean, info: string }[]} */
+        const results = [];
+        try {
+            // Probe 1: embedding + vector query roundtrip via the ST server
+            try {
+                const chatId = getCurrentChatId();
+                if (!chatId) {
+                    throw new Error('no chat selected');
+                }
+                const startedAt = Date.now();
+                await queryCollection(chatId, 'vector storage diagnostic probe', 1, 0);
+                results.push({ name: 'Embedding+Query', ok: true, info: `roundtrip ${Date.now() - startedAt}ms` });
+            } catch (error) {
+                results.push({ name: 'Embedding+Query', ok: false, info: String(error?.message || error) });
+            }
+
+            // Probe 2: reranker connectivity
+            if (settings.rerank_enabled) {
+                const rerankResult = await testRerankerConnection();
+                results.push({ name: 'Reranker', ok: rerankResult.ok, info: rerankResult.message });
+            } else {
+                results.push({ name: 'Reranker', ok: true, info: 'disabled' });
+            }
+
+            // Probe 3: chunk splitter integrity with a multibyte sample
+            try {
+                const sample = '第一段😀emoji测试🎉包含中文and English mixed text。第二段落继续直到被切开';
+                const pieces = splitRecursive(sample, 7, []);
+                const broken = pieces.filter(piece => LONE_SURROGATE_REGEX.test(String(piece)));
+                results.push({
+                    name: 'Chunk splitter',
+                    ok: broken.length === 0,
+                    info: broken.length === 0
+                        ? `${pieces.length} pieces, no broken surrogates`
+                        : `${broken.length}/${pieces.length} pieces contain BROKEN emoji (lone surrogates)! Keep emoji cleaning upstream.`,
+                });
+            } catch (error) {
+                results.push({ name: 'Chunk splitter', ok: false, info: String(error?.message || error) });
+            }
+
+            const failedCount = results.filter(x => !x.ok).length;
+            const summary = results.map(x => `${x.ok ? '✓' : '✗'} <b>${escapeHtml(x.name)}</b>: ${escapeHtml(x.info)}`).join('<br>');
+            const level = failedCount > 0 ? 'warning' : 'success';
+            toastr[level](summary, 'Vector Storage Diagnostics', { timeOut: 15000, escapeHtml: false });
+            for (const result of results) {
+                ragLogEvent('system', result.ok ? 'info' : 'warn', `Diagnostics [${result.name}]: ${result.ok ? 'OK' : 'FAILED'}`, { info: result.info });
+            }
+            updateStatusBadge(failedCount > 0 ? `⚠ ${failedCount} check(s) failed` : '✓ all checks passed', failedCount > 0 ? 'warn' : 'info');
+        } finally {
+            button.removeClass('busy');
+        }
+    });
+
     $('#vectors_force_chunk_delimiter').val(settings.force_chunk_delimiter).on('input', () => {
         settings.force_chunk_delimiter = String($('#vectors_force_chunk_delimiter').val());
         Object.assign(extension_settings.vectors, settings);
@@ -2038,6 +2775,9 @@ jQuery(async () => {
     });
 
     toggleSettings();
+    renderRagLog();
+    renderLastReport();
+    updateStatusBadge(ragLogEntries.length ? `(last session: ${ragLogEntries.length} log entries)` : '(idle)', 'info');
     eventSource.on(event_types.MESSAGE_DELETED, onChatEvent);
     eventSource.on(event_types.MESSAGE_EDITED, onChatEvent);
     eventSource.on(event_types.MESSAGE_SENT, onChatEvent);

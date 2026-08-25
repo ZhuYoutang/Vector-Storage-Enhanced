@@ -2,3 +2,102 @@
     content: '🟢';
     margin-left: 5px;
 }
+
+/* Diagnostics panel */
+.rag-badge {
+    padding: 2px 8px;
+    border-radius: 8px;
+    font-size: 0.85em;
+    white-space: nowrap;
+}
+
+.rag-badge-ok {
+    background-color: var(--green, #2e7d32);
+    color: white;
+}
+
+.rag-badge-warn {
+    background-color: var(--warning, #f57f17);
+    color: black;
+}
+
+.rag-badge-err {
+    background-color: var(--crimson, #c62828);
+    color: white;
+}
+
+.rag-log-viewer {
+    max-height: 220px;
+    overflow-y: auto;
+    font-family: var(--monoFontFamily, monospace);
+    font-size: 0.8em;
+    background-color: var(--black30a, rgba(0, 0, 0, 0.3));
+    border-radius: 5px;
+    padding: 5px;
+    margin-top: 5px;
+}
+
+.rag-log-line {
+    padding: 1px 0;
+    word-break: break-word;
+}
+
+.rag-log-time {
+    opacity: 0.6;
+}
+
+.rag-log-type {
+    opacity: 0.8;
+}
+
+.rag-log-warn .rag-log-detail,
+.rag-log-warn {
+    color: var(--golden, #ffc107);
+}
+
+.rag-log-error .rag-log-detail,
+.rag-log-error {
+    color: var(--crimson, #ff6b6b);
+}
+
+.rag-log-detail {
+    display: block;
+    opacity: 0.7;
+    padding-left: 1.5em;
+}
+
+/* Recall report table */
+#vectors_last_report {
+    margin-top: 5px;
+    font-size: 0.85em;
+}
+
+.rag-report-meta {
+    opacity: 0.75;
+    margin-bottom: 3px;
+    word-break: break-all;
+}
+
+.rag-report-killed {
+    color: var(--golden, #ffc107);
+    margin-bottom: 2px;
+    word-break: break-word;
+}
+
+.rag-report-table {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+.rag-report-table th,
+.rag-report-table td {
+    border: 1px solid var(--grey30a, rgba(128, 128, 128, 0.3));
+    padding: 3px 5px;
+    text-align: left;
+    vertical-align: top;
+}
+
+.rag-report-text {
+    word-break: break-word;
+    max-width: 320px;
+}
