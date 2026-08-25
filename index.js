@@ -11,33 +11,33 @@ import {
     substituteParams,
     generateRaw,
     substituteParamsExtended,
-} from '../../../script.js';
+} from '../../../../script.js';
 import {
     ModuleWorkerWrapper,
     extension_settings,
     getContext,
     modules,
-    renderExtensionTemplateAsync,
     doExtrasFetch, getApiUrl,
     openThirdPartyExtensionMenu,
-} from '../../extensions.js';
-import { collapseNewlines, registerDebugFunction } from '../../power-user.js';
-import { SECRET_KEYS, secret_state } from '../../secrets.js';
-import { getDataBankAttachments, getDataBankAttachmentsForSource, getFileAttachment } from '../../chats.js';
-import { debounce, getStringHash as calculateHash, waitUntilCondition, onlyUnique, splitRecursive, trimToStartSentence, trimToEndSentence, escapeHtml, isTrueBoolean } from '../../utils.js';
-import { debounce_timeout } from '../../constants.js';
-import { getSortedEntries } from '../../world-info.js';
-import { textgen_types, textgenerationwebui_settings } from '../../textgen-settings.js';
-import { SlashCommandParser } from '../../slash-commands/SlashCommandParser.js';
-import { SlashCommand } from '../../slash-commands/SlashCommand.js';
-import { ARGUMENT_TYPE, SlashCommandArgument, SlashCommandNamedArgument } from '../../slash-commands/SlashCommandArgument.js';
-import { SlashCommandEnumValue, enumTypes } from '../../slash-commands/SlashCommandEnumValue.js';
-import { commonEnumProviders } from '../../slash-commands/SlashCommandCommonEnumsProvider.js';
-import { slashCommandReturnHelper } from '../../slash-commands/SlashCommandReturnHelper.js';
-import { generateWebLlmChatPrompt, isWebLlmSupported } from '../shared.js';
+} from '../../../extensions.js';
+import { renderTemplateAsync } from '../../../templates.js';
+import { collapseNewlines, registerDebugFunction } from '../../../power-user.js';
+import { SECRET_KEYS, secret_state } from '../../../secrets.js';
+import { getDataBankAttachments, getDataBankAttachmentsForSource, getFileAttachment } from '../../../chats.js';
+import { debounce, getStringHash as calculateHash, waitUntilCondition, onlyUnique, splitRecursive, trimToStartSentence, trimToEndSentence, escapeHtml, isTrueBoolean } from '../../../utils.js';
+import { debounce_timeout } from '../../../constants.js';
+import { getSortedEntries } from '../../../world-info.js';
+import { textgen_types, textgenerationwebui_settings } from '../../../textgen-settings.js';
+import { SlashCommandParser } from '../../../slash-commands/SlashCommandParser.js';
+import { SlashCommand } from '../../../slash-commands/SlashCommand.js';
+import { ARGUMENT_TYPE, SlashCommandArgument, SlashCommandNamedArgument } from '../../../slash-commands/SlashCommandArgument.js';
+import { SlashCommandEnumValue, enumTypes } from '../../../slash-commands/SlashCommandEnumValue.js';
+import { commonEnumProviders } from '../../../slash-commands/SlashCommandCommonEnumsProvider.js';
+import { slashCommandReturnHelper } from '../../../slash-commands/SlashCommandReturnHelper.js';
+import { generateWebLlmChatPrompt, isWebLlmSupported } from '../../shared.js';
 import { WebLlmVectorProvider } from './webllm.js';
-import { removeReasoningFromString } from '../../reasoning.js';
-import { oai_settings } from '../../openai.js';
+import { removeReasoningFromString } from '../../../reasoning.js';
+import { oai_settings } from '../../../openai.js';
 
 /**
  * @typedef {object} HashedMessage
@@ -45,8 +45,6 @@ import { oai_settings } from '../../openai.js';
  * @property {number} hash - The hash used as the vector key
  * @property {number} index - The index of the message in the chat
  */
-
-const MODULE_NAME = 'vectors';
 
 export const EXTENSION_PROMPT_TAG = '3_vectors';
 export const EXTENSION_PROMPT_TAG_DB = '4_vectors_data_bank';
@@ -2310,7 +2308,9 @@ jQuery(async () => {
     }
     lastRecallReport = extension_settings.vectors.debug_last_report || null;
 
-    const template = await renderExtensionTemplateAsync(MODULE_NAME, 'settings');
+    // Load the settings template relative to this module's own URL.
+    // The bundled renderExtensionTemplateAsync assumes a non-third-party folder layout.
+    const template = await renderTemplateAsync(new URL('settings.html', import.meta.url).href, {}, true, true, true);
     $('#vectors_container').append(template);
     $('#vectors_enabled_chats').prop('checked', settings.enabled_chats).on('input', () => {
         settings.enabled_chats = $('#vectors_enabled_chats').prop('checked');
