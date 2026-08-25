@@ -120,6 +120,8 @@ const settings = {
     rerank_recall: 30,
     rerank_ignore_threshold: true,
     rerank_query_max_chars: 2000,
+    rerank_doc_max_chars: 1600,
+    rerank_timeout_ms: 60000,
 
     // For Diagnostics
     debug_enabled: true,
@@ -1504,6 +1506,16 @@ async function rerankTexts(queryText, texts, force = false) {
         ? `${queryText.slice(0, maxChars)}…`
         : queryText;
 
+    // Bound the document side too: chat-path candidates are full messages and can be huge,
+    // which is the main driver of CPU rerank latency.
+    const docMaxChars = Number(settings.rerank_doc_max_chars);
+    const boundedDocs = texts.map(text => {
+        const str = String(text);
+        return Number.isFinite(docMaxChars) && docMaxChars > 0 && str.length > docMaxChars
+            ? `${str.slice(0, docMaxChars)}…`
+            : str;
+    });
+
     /** @type {Record<string, string>} */
     const headers = { 'Content-Type': 'application/json' };
     const apiKey = String(settings.rerank_key || '').trim();
@@ -1511,15 +1523,24 @@ async function rerankTexts(queryText, texts, force = false) {
         headers['Authorization'] = `Bearer ${apiKey}`;
     }
 
+    const timeoutMs = Number(settings.rerank_timeout_ms);
+    const signal = Number.isFinite(timeoutMs) && timeoutMs > 0 && typeof AbortSignal !== 'undefined' && AbortSignal.timeout
+        ? AbortSignal.timeout(timeoutMs)
+        : undefined;
+
     const startedAt = Date.now();
+    const totalChars = trimmedQuery.length + boundedDocs.reduce((sum, doc) => sum + doc.length, 0);
+    ragLogEvent('rerank', 'info', `Dispatching ${boundedDocs.length} pairs (~${Math.round(totalChars / 1000)}k chars total)`, { timeoutMs: timeoutMs || 'none' });
+
     try {
         const response = await fetch(`${baseUrl}/v1/rerank`, {
             method: 'POST',
             headers: headers,
+            signal: signal,
             body: JSON.stringify({
                 model: String(settings.rerank_model || '').trim(),
                 query: trimmedQuery,
-                documents: texts,
+                documents: boundedDocs,
                 top_n: texts.length,
             }),
         });
@@ -1550,10 +1571,14 @@ async function rerankTexts(queryText, texts, force = false) {
         rerankWarnedOnce = false;
         return scored;
     } catch (error) {
+        const isTimeout = error?.name === 'AbortError' || error?.name === 'TimeoutError';
+        const reason = isTimeout
+            ? `timed out after ${timeoutMs}ms (lower Recall count / truncations, or raise the timeout)`
+            : String(error?.message || error);
         console.error('Vectors: Reranker failed, falling back to vector order', error);
-        ragLogEvent('rerank', 'warn', `Reranker failed: ${error?.message || error}. Falling back to vector order.`);
+        ragLogEvent('rerank', 'warn', `Reranker failed: ${reason}. Falling back to vector order.`);
         if (!rerankWarnedOnce) {
-            toastr.warning(`Reranker failed (${error?.message || error}). Using embedding order instead.`, 'Vector Storage');
+            toastr.warning(`Reranker failed (${reason}). Using embedding order instead.`, 'Vector Storage');
             rerankWarnedOnce = true;
         }
         return originalOrder;
@@ -2607,6 +2632,16 @@ jQuery(async () => {
     });
     $('#vectors_rerank_query_max_chars').val(settings.rerank_query_max_chars).on('input', () => {
         settings.rerank_query_max_chars = Number($('#vectors_rerank_query_max_chars').val());
+        Object.assign(extension_settings.vectors, settings);
+        saveSettingsDebounced();
+    });
+    $('#vectors_rerank_doc_max_chars').val(settings.rerank_doc_max_chars).on('input', () => {
+        settings.rerank_doc_max_chars = Number($('#vectors_rerank_doc_max_chars').val());
+        Object.assign(extension_settings.vectors, settings);
+        saveSettingsDebounced();
+    });
+    $('#vectors_rerank_timeout_ms').val(settings.rerank_timeout_ms).on('input', () => {
+        settings.rerank_timeout_ms = Number($('#vectors_rerank_timeout_ms').val());
         Object.assign(extension_settings.vectors, settings);
         saveSettingsDebounced();
     });

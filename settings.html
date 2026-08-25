@@ -547,6 +547,20 @@
                         <input id="vectors_rerank_query_max_chars" class="text_pole widthUnset" type="number" min="100" max="32000" step="100" />
                     </div>
                 </div>
+                <div class="flex-container">
+                    <div class="flex1" title="Chat-path candidates are full messages and can be huge. Truncate each candidate to this many characters before sending to the reranker. This is the main lever against slow CPU reranking.">
+                        <label for="vectors_rerank_doc_max_chars">
+                            <small data-i18n="Doc Truncation">Doc truncation (chars)</small>
+                        </label>
+                        <input id="vectors_rerank_doc_max_chars" class="text_pole widthUnset" type="number" min="100" max="32000" step="100" />
+                    </div>
+                    <div class="flex1" title="Give up on the rerank call after this long (ms) and fall back to embedding order. Prevents a slow/overloaded server from stalling generation.">
+                        <label for="vectors_rerank_timeout_ms">
+                            <small data-i18n="Rerank Timeout">Timeout (ms)</small>
+                        </label>
+                        <input id="vectors_rerank_timeout_ms" class="text_pole widthUnset" type="number" min="3000" max="600000" step="1000" />
+                    </div>
+                </div>
                 <label class="checkbox_label" for="vectors_rerank_ignore_threshold" title="Recommended: during the wide-recall phase, bypass the embedding score threshold entirely and let the reranker decide what matters.">
                     <input id="vectors_rerank_ignore_threshold" type="checkbox" class="checkbox">
                     <span>
