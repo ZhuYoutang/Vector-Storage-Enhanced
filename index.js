@@ -174,6 +174,40 @@ function updateStatusBadge(text, level = 'info') {
 }
 
 /**
+ * Logistic function used to map raw reranker logits to a [0, 1] relevance probability.
+ * llama.cpp-style backends return unnormalized logits, so percentages need this conversion.
+ * @param {number} x Raw logit
+ * @returns {number} Value in (0, 1)
+ */
+function sigmoid(x) {
+    return 1 / (1 + Math.exp(-x));
+}
+
+/**
+ * Formats a raw reranker score for display as "raw (sigmoid%)".
+ * @param {number|null|undefined} score Raw relevance score
+ * @returns {string} Human readable score, '-' when unavailable
+ */
+function formatRerankScore(score) {
+    if (!Number.isFinite(score)) {
+        return '-';
+    }
+    return `${score.toFixed(3)} (${(sigmoid(score) * 100).toFixed(1)}%)`;
+}
+
+/**
+ * Formats just the sigmoid percentage of a raw reranker score.
+ * @param {number|null|undefined} score Raw relevance score
+ * @returns {string} Percentage string, '-' when unavailable
+ */
+function formatSigmoidPercent(score) {
+    if (!Number.isFinite(score)) {
+        return '-';
+    }
+    return `${(sigmoid(score) * 100).toFixed(1)}%`;
+}
+
+/**
  * Records a structured diagnostic event.
  * @param {string} type Event type ('vectorize'|'query'|'rerank'|'inject'|'system')
  * @param {string} level 'info'|'warn'|'error'
@@ -234,13 +268,25 @@ function renderRagLog() {
  */
 function recordRecallReport(report) {
     lastRecallReport = report;
-    updateStatusBadge(`✓ ${report.finalCount ?? 0} injected (${report.tookMs ?? '?'}ms)`, 'info');
+    // All report-producing paths go through getRecallParams, which forces the recall
+    // threshold to 0 exactly when the reranker is active and "ignore threshold" is set.
+    report.thresholdIgnored = shouldRerank() && !!settings.rerank_ignore_threshold;
+
+    const topScore = report.reranked ? (report.candidates?.[0]?.rerankScore ?? null) : null;
+    const allWeak = Number.isFinite(topScore) && sigmoid(topScore) < 0.5;
+
+    updateStatusBadge(allWeak
+        ? `⚠ ${report.finalCount ?? 0} injected · all weak (top ${formatSigmoidPercent(topScore)})`
+        : `✓ ${report.finalCount ?? 0} injected (${report.tookMs ?? '?'}ms)`, allWeak ? 'warn' : 'info');
     ragLogEvent(report.path, 'info', `Recall: ${report.candidates?.length ?? 0} candidates -> ${report.finalCount ?? 0} final` +
         `${report.reranked ? ' [reranked]' : ''}`, {
         topK: report.topK,
         threshold: report.threshold,
         tookMs: report.tookMs,
     });
+    if (allWeak) {
+        ragLogEvent(report.path, 'warn', `All reranked candidates weakly relevant (best raw ${topScore.toFixed(3)} = ${formatSigmoidPercent(topScore)}). Check recall pool/query text.`, { topScore: topScore });
+    }
     renderLastReport();
     saveRagLogDebounced();
 }
@@ -269,7 +315,10 @@ function renderLastReport() {
     }
 
     const r = lastRecallReport;
-    const head = `<div class="rag-report-meta">path=<b>${escapeHtml(r.path)}</b> | topK=${r.topK} | threshold=${r.threshold}` +
+    const thresholdLabel = r.thresholdIgnored
+        ? `${r.threshold} <i>(forced 0 — reranker decides)</i>`
+        : `${r.threshold} <i>(recall pre-filter)</i>`;
+    const head = `<div class="rag-report-meta">path=<b>${escapeHtml(r.path)}</b> | topK=${r.topK} | threshold=${thresholdLabel}` +
         ` | reranked=${r.reranked ? 'yes' : 'no'} | took=${r.tookMs}ms</div>` +
         `<div class="rag-report-meta">query: ${escapeHtml(String(r.queryPreview || '').slice(0, 300))}</div>`;
 
@@ -277,15 +326,20 @@ function renderLastReport() {
     const killedRows = killed.map(k =>
         `<div class="rag-report-killed">[killed by threshold] ${escapeHtml(k)}</div>`).join('');
 
+    const topScore = r.reranked ? (r.candidates?.[0]?.rerankScore ?? null) : null;
+    const weakBanner = Number.isFinite(topScore) && sigmoid(topScore) < 0.5
+        ? `<div class="rag-report-killed">⚠ all candidates weakly relevant (best: ${formatRerankScore(topScore)})</div>`
+        : '';
+
     const rows = (r.candidates || []).map(c => {
         const status = c.inserted ? '<b style="color:var(--okGreen)">INSERTED</b>' : `cut (${c.reason})`;
-        return `<tr><td>${c.rank}</td><td>${escapeHtml(String(c.rerankScore ?? '-'))}</td><td>${status}</td><td class="rag-report-text">${escapeHtml(c.text)}</td></tr>`;
+        return `<tr><td>${c.rank}</td><td>${escapeHtml(formatRerankScore(c.rerankScore))}</td><td>${status}</td><td class="rag-report-text">${escapeHtml(c.text)}</td></tr>`;
     }).join('');
     const table = rows
         ? `<table class="rag-report-table"><thead><tr><th>#</th><th>rerank</th><th>status</th><th>text preview</th></tr></thead><tbody>${rows}</tbody></table>`
         : '<small>(no candidates returned)</small>';
 
-    container.html(head + killedRows + table);
+    container.html(head + weakBanner + killedRows + table);
 }
 
 /**
@@ -784,7 +838,14 @@ async function injectDataBankChunks(queryText, collectionIds) {
         const pooledTexts = [];
         for (const collectionId in queryResults) {
             console.debug(`Vectors: Processing Data Bank collection ${collectionId}`, queryResults[collectionId]);
-            const metadata = queryResults[collectionId].metadata?.filter(x => x.text)?.sort((a, b) => a.index - b.index)?.map(x => x.text)?.filter(onlyUnique) || [];
+            // Keep the server's similarity order when reranking: the rerank-failure fallback
+            // returns candidates in input order, which must stay relevance-ranked.
+            // Document order only matters for the legacy non-rerank join.
+            const collectionMetadata = queryResults[collectionId].metadata?.filter(x => x.text) || [];
+            if (!shouldRerank()) {
+                collectionMetadata.sort((a, b) => a.index - b.index);
+            }
+            const metadata = collectionMetadata.map(x => x.text).filter(onlyUnique);
 
             if (shouldRerank()) {
                 for (const text of metadata) {
@@ -854,7 +915,13 @@ async function retrieveFileChunks(queryText, collectionId) {
     const startedAt = Date.now();
     const queryResults = await queryCollection(collectionId, queryText, recallTopK, recallThreshold);
     console.debug(`Vectors: Retrieved ${queryResults.hashes.length} file chunks for collection ${collectionId}`, queryResults);
-    const metadata = queryResults.metadata.filter(x => x.text).sort((a, b) => a.index - b.index).map(x => x.text).filter(onlyUnique);
+    // Same as the Data Bank path: similarity order must survive until rerankTexts so a
+    // fallback (reranker down) still yields relevance-ranked results.
+    const fileMetadata = queryResults.metadata.filter(x => x.text);
+    if (!shouldRerank()) {
+        fileMetadata.sort((a, b) => a.index - b.index);
+    }
+    const metadata = fileMetadata.map(x => x.text).filter(onlyUnique);
 
     let fileText;
     let finalCandidates;
@@ -1015,21 +1082,29 @@ async function rearrangeChat(chat, _contextSize, _abort, type) {
 
         // Fix: derive hashes from metadata (which IS filtered server-side by score threshold),
         // otherwise the score threshold silently has no effect on the chat path.
+        // queryResults.metadata arrives sorted by similarity desc; candidate order must follow
+        // it so a rerank-failure fallback keeps vector ranking instead of chat chronology.
         const queryHashes = (queryResults.metadata || []).map(x => Number(x.hash)).filter(onlyUnique);
         const retainMessages = chat.slice(-settings.protect);
 
-        // Collect candidate messages in chat order (first occurrence of each hash wins)
-        const candidateMessages = [];
-        const seenCandidateHashes = new Set();
-
+        // Map each hash to its first matching message in chat order (protected messages skipped)
+        const messageByHash = new Map();
         for (const message of chat) {
             if (retainMessages.includes(message) || !message.mes) {
                 continue;
             }
             const hash = getStringHash(substituteParams(message.mes));
-            if (queryHashes.includes(hash) && !seenCandidateHashes.has(hash)) {
+            if (!messageByHash.has(hash)) {
+                messageByHash.set(hash, message);
+            }
+        }
+
+        // Collect candidate messages in vector-similarity order
+        const candidateMessages = [];
+        for (const hash of queryHashes) {
+            const message = messageByHash.get(hash);
+            if (message) {
                 candidateMessages.push({ message: message, hash: hash });
-                seenCandidateHashes.add(hash);
             }
         }
 
@@ -1555,9 +1630,12 @@ async function rerankTexts(queryText, texts, force = false) {
             throw new Error('empty results');
         }
 
+        // Treat missing/garbage scores as null instead of 0: llama.cpp-style backends return
+        // raw logits where negative values are common, and a fake 0 would outrank real negatives.
         const scored = results
-            .map(x => ({ index: Number(x.index), score: Number(x.relevance_score ?? x.score ?? 0) }))
-            .filter(x => Number.isInteger(x.index) && x.index >= 0 && x.index < texts.length);
+            .map(x => ({ index: Number(x.index), score: Number(x.relevance_score ?? x.score) }))
+            .filter(x => Number.isInteger(x.index) && x.index >= 0 && x.index < texts.length)
+            .map(x => ({ index: x.index, score: Number.isFinite(x.score) ? x.score : null }));
 
         // Append anything the API skipped, preserving the original order at the end
         const seen = new Set(scored.map(x => x.index));
@@ -1567,7 +1645,19 @@ async function rerankTexts(queryText, texts, force = false) {
             }
         }
 
-        ragLogEvent('rerank', 'info', `Reranked ${texts.length} docs in ${Date.now() - startedAt}ms`, { topScore: scored[0]?.score });
+        // Defensive: not every /v1/rerank backend returns results sorted by relevance.
+        // Enforce descending score order; ties keep original index order, null scores sink.
+        scored.sort((a, b) => {
+            if (a.score === null || b.score === null) {
+                return (a.score === null ? 1 : 0) - (b.score === null ? 1 : 0);
+            }
+            return b.score - a.score || a.index - b.index;
+        });
+
+        ragLogEvent('rerank', 'info', `Reranked ${texts.length} docs in ${Date.now() - startedAt}ms`, {
+            topScore: scored[0]?.score,
+            topSigmoidPct: formatSigmoidPercent(scored[0]?.score),
+        });
         rerankWarnedOnce = false;
         return scored;
     } catch (error) {
