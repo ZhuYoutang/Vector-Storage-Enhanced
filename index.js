@@ -2146,6 +2146,8 @@ async function createKoboldCppEmbeddings(items) {
  * Normalizes a user-entered One-API base URL.
  * - Trims whitespace and trailing slashes
  * - Strips a trailing "/embeddings" if the user pasted the full endpoint (e.g. ".../v1/embeddings")
+ * - Ensures the base ends with "/v1" so bare hosts like "http://192.168.10.2:3000" work
+ *   (mirrors reranker pattern where baseUrl without /v1 + "/v1/rerank" is valid)
  * @param {string} url Raw URL from settings
  * @returns {string} Normalized base URL (e.g. "https://api.openai.com/v1")
  */
@@ -2154,6 +2156,11 @@ function normalizeOneApiBaseUrl(url) {
     // User may have pasted the full embeddings endpoint; strip it to avoid ".../embeddings/embeddings"
     if (/\/embeddings$/i.test(baseUrl)) {
         baseUrl = baseUrl.replace(/\/embeddings$/i, '').replace(/\/+$/, '');
+    }
+    // One-API/New-API serves OpenAI-compatible APIs under /v1. Accept both
+    // "http://host:3000" and "http://host:3000/v1" from user input.
+    if (!/\/v1$/i.test(baseUrl)) {
+        baseUrl = `${baseUrl}/v1`;
     }
     return baseUrl;
 }
