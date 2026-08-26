@@ -2167,10 +2167,11 @@ function normalizeOneApiBaseUrl(url) {
 
 /**
  * Builds candidate endpoints for One-API embeddings.
- * One-API/New-API is model-routed, so some deployments accept POST to the
- * bare base URL (e.g. http://host:3000) and dispatch by `model` field,
- * while standard OpenAI-compatible uses /v1/embeddings. Try bare first
- * per user feedback, then fall back to OpenAI-standard paths.
+ * One-API/New-API serves OpenAI-compatible embeddings under /v1/embeddings;
+ * POSTing to the bare /v1 base returns "Invalid URL", and the bare host
+ * returns the admin panel (HTML). Try the OpenAI-standard path first, then
+ * fall back to model-routed / bare-host variants for proxies that dispatch
+ * by the `model` field.
  * @param {string} rawUrl Raw URL from settings
  * @returns {string[]} Candidate endpoints in priority order
  */
@@ -2181,24 +2182,25 @@ function getOneApiCandidateEndpoints(rawUrl) {
     if (/\/embeddings$/i.test(raw)) {
         return [raw];
     }
+    const base = raw.replace(/\/v1$/i, '').replace(/\/+$/, '');
     const candidates = [];
-    // Per user request: try bare URL first (model-based routing)
-    candidates.push(raw);
+    // OpenAI-standard path first – the only endpoint One-API/New-API serves
+    candidates.push(`${base}/v1/embeddings`);
     if (/\/v1$/i.test(raw)) {
         candidates.push(`${raw}/embeddings`);
-    } else {
-        candidates.push(`${raw}/v1/embeddings`);
-        candidates.push(`${raw}/embeddings`);
-        candidates.push(`${raw}/v1`);
     }
+    // Model-routed / bare-host fallbacks (may return the admin panel on One-API)
+    candidates.push(`${base}/embeddings`);
+    candidates.push(base);
+    candidates.push(`${base}/v1`);
     // Deduplicate
     return [...new Set(candidates)];
 }
 
 /**
  * Creates One-API (OpenAI-compatible) embeddings for a list of items.
- * Frontend-direct to One-API, tries bare URL first (model-routed) then
- * falls back to OpenAI-standard /v1/embeddings (mirrors reranker fallback).
+ * Frontend-direct to One-API, tries OpenAI-standard /v1/embeddings first,
+ * then falls back to model-routed / bare-host variants (mirrors reranker fallback).
  * @param {string[]} items Items to embed
  * @returns {Promise<Record<string, number[]>>} Calculated embeddings mapped by text
  */
@@ -2284,8 +2286,13 @@ async function createOneApiEmbeddings(items) {
         }
         return embeddings;
     }
-    // All candidates exhausted
-    throw lastError || new Error(`One-API embeddings failed at ${lastEndpoint}: no candidate succeeded`);
+    // All candidates exhausted – surface the last error with every attempted endpoint
+    const tried = [...new Set(candidates)].join(', ');
+    if (lastError) {
+        lastError.message = `${lastError.message} (tried: ${tried})`;
+        throw lastError;
+    }
+    throw new Error(`One-API embeddings failed at ${lastEndpoint}: no candidate succeeded (tried: ${tried})`);
 }
 
 /**
