@@ -2143,6 +2143,22 @@ async function createKoboldCppEmbeddings(items) {
 }
 
 /**
+ * Normalizes a user-entered One-API base URL.
+ * - Trims whitespace and trailing slashes
+ * - Strips a trailing "/embeddings" if the user pasted the full endpoint (e.g. ".../v1/embeddings")
+ * @param {string} url Raw URL from settings
+ * @returns {string} Normalized base URL (e.g. "https://api.openai.com/v1")
+ */
+function normalizeOneApiBaseUrl(url) {
+    let baseUrl = String(url || '').trim().replace(/\/+$/, '');
+    // User may have pasted the full embeddings endpoint; strip it to avoid ".../embeddings/embeddings"
+    if (/\/embeddings$/i.test(baseUrl)) {
+        baseUrl = baseUrl.replace(/\/embeddings$/i, '').replace(/\/+$/, '');
+    }
+    return baseUrl;
+}
+
+/**
  * Creates One-API (OpenAI-compatible) embeddings for a list of items.
  * Frontend-direct to One-API /v1/embeddings, mirroring reranker pattern.
  * @param {string[]} items Items to embed
@@ -2152,7 +2168,7 @@ async function createOneApiEmbeddings(items) {
     if (items.length === 0) {
         return /** @type {Record<string, number[]>} */ ({});
     }
-    const baseUrl = String(settings.oneapi_url || '').trim().replace(/\/+$/, '');
+    const baseUrl = normalizeOneApiBaseUrl(settings.oneapi_url);
     const apiKey = String(settings.oneapi_key || '').trim();
     const model = String(settings.oneapi_model || '').trim();
     if (!baseUrl) {
@@ -2165,21 +2181,40 @@ async function createOneApiEmbeddings(items) {
     if (apiKey) {
         headers['Authorization'] = `Bearer ${apiKey}`;
     }
-    const response = await fetch(`${baseUrl}/embeddings`, {
-        method: 'POST',
-        headers: headers,
-        body: JSON.stringify({
-            model: model,
-            input: items,
-        }),
-    });
-    if (!response.ok) {
-        const text = await response.text().catch(() => '');
-        throw new Error(`One-API embeddings failed: HTTP ${response.status} ${response.statusText} ${text.slice(0, 300)}`);
+    const endpoint = `${baseUrl}/embeddings`;
+    let response;
+    try {
+        response = await fetch(endpoint, {
+            method: 'POST',
+            headers: headers,
+            body: JSON.stringify({
+                model: model,
+                input: items,
+            }),
+        });
+    } catch (error) {
+        // Network/CORS failure - fetch throws TypeError
+        const msg = String(error?.message || error);
+        throw new Error(`One-API network error fetching ${endpoint}: ${msg} — check URL reachable, CORS allowed, and One-API service is running`);
     }
-    const data = await response.json();
+    // Always read as text first so we can show raw body when server returns HTML (JSON.parse "<" error)
+    const rawText = await response.text().catch(() => '');
+    if (!response.ok) {
+        // Try to surface JSON error details if body is JSON, otherwise show raw preview (often HTML)
+        throw new Error(`One-API embeddings failed: HTTP ${response.status} ${response.statusText} at ${endpoint} — body: ${rawText.slice(0, 500)}`);
+    }
+    let data;
+    try {
+        data = rawText ? JSON.parse(rawText) : null;
+    } catch (parseError) {
+        const preview = rawText.slice(0, 500).replace(/\s+/g, ' ');
+        const hint = rawText.trim().startsWith('<')
+            ? 'Server returned HTML instead of JSON (often wrong URL, e.g. missing /v1, or One-API login page / Cloudflare challenge). Verify Endpoint URL ends with /v1'
+            : 'Server returned non-JSON';
+        throw new Error(`One-API returned non-JSON at ${endpoint}: ${hint}. Parse error: ${parseError?.message || parseError} — body preview: ${preview}`);
+    }
     if (!Array.isArray(data?.data)) {
-        throw new Error('One-API response missing data array');
+        throw new Error(`One-API response missing data array at ${endpoint} — body: ${rawText.slice(0, 500)}`);
     }
     data.data.sort((a, b) => a.index - b.index);
     if (data.data.length !== items.length) {
@@ -2202,15 +2237,24 @@ async function createOneApiEmbeddings(items) {
  */
 async function testOneApiConnection() {
     const startedAt = Date.now();
+    const endpoint = `${normalizeOneApiBaseUrl(settings.oneapi_url)}/embeddings`;
     try {
+        // Pre-flight validation for clearer messages
+        if (!String(settings.oneapi_url || '').trim()) {
+            return { ok: false, message: `One-API test failed: Endpoint URL is empty (expected e.g. https://api.openai.com/v1)`, ms: Date.now() - startedAt };
+        }
+        if (!String(settings.oneapi_model || '').trim()) {
+            return { ok: false, message: `One-API test failed: Model ID is empty`, ms: Date.now() - startedAt };
+        }
         const embeddings = await createOneApiEmbeddings(['Hello world']);
         const vector = Object.values(embeddings)[0];
         const ms = Date.now() - startedAt;
         if (!Array.isArray(vector) || vector.length === 0) {
-            return { ok: false, message: 'No embedding returned', ms };
+            return { ok: false, message: `No embedding returned from ${endpoint}`, ms };
         }
-        return { ok: true, message: `One-API OK in ${ms}ms (dim=${vector.length}, model=${String(settings.oneapi_model || '').trim()})`, ms };
+        return { ok: true, message: `One-API OK in ${ms}ms (dim=${vector.length}, model=${String(settings.oneapi_model || '').trim()}, endpoint=${endpoint})`, ms };
     } catch (error) {
+        console.error('Vectors: One-API test failed', { endpoint, error });
         return { ok: false, message: `One-API test failed: ${error?.message || error}`, ms: Date.now() - startedAt };
     }
 }
