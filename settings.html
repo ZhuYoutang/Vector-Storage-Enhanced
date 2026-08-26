@@ -29,6 +29,7 @@
                     <option value="togetherai">TogetherAI</option>
                     <option value="vllm">vLLM</option>
                     <option value="webllm" data-i18n="WebLLM Extension">WebLLM Extension</option>
+                    <option value="one-api">One-API (OpenAI Compatible)</option>
                 </select>
             </div>
             <div class="flex-container flexFlowColumn" id="chutes_vectorsModel">
@@ -203,6 +204,34 @@
                 <i data-i18n="Hint: Set your SiliconFlow API key in API Connections.">
                     Hint: Set your SiliconFlow API key in API Connections.
                 </i>
+            </div>
+            <div class="flex-container flexFlowColumn" id="oneapi_vectorsModel">
+                <label for="vectors_oneapi_url">
+                    <small data-i18n="One-API Endpoint URL">One-API Endpoint URL (/v1)</small>
+                </label>
+                <input id="vectors_oneapi_url" class="text_pole" type="text" placeholder="https://api.openai.com/v1  or  http://127.0.0.1:3000/v1" />
+                <div class="flex-container">
+                    <div class="flex1">
+                        <label for="vectors_oneapi_model">
+                            <small data-i18n="Model ID">Model ID</small>
+                        </label>
+                        <input id="vectors_oneapi_model" class="text_pole" type="text" placeholder="text-embedding-3-small" />
+                    </div>
+                    <div class="flex1" title="API key sent as Bearer token.">
+                        <label for="vectors_oneapi_key">
+                            <small data-i18n="API Key">API Key</small>
+                        </label>
+                        <input id="vectors_oneapi_key" class="text_pole" type="password" placeholder="sk-..." />
+                    </div>
+                </div>
+                <div class="flex-container">
+                    <div id="vectors_oneapi_test" class="menu_button menu_button_icon" title="Send a test embedding request to the One-API endpoint.">
+                        <span>Test One-API</span>
+                    </div>
+                </div>
+                <small>
+                    OpenAI-compatible: <code>/v1/embeddings</code> · Works with One-API / New-API / any OpenAI proxy
+                </small>
             </div>
 
             <div class="flex-container marginTopBot5">

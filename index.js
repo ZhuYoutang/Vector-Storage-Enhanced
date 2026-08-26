@@ -52,6 +52,11 @@ export const EXTENSION_PROMPT_TAG_DB = '4_vectors_data_bank';
 // Force solo chunks for sources that don't support batching.
 const getBatchSize = () => ['transformers', 'ollama'].includes(settings.source) ? 1 : 5;
 
+// One-API is OpenAI-compatible but handled frontend-direct (no ST backend change).
+// To reuse ST's /api/vector storage, map it to a backend source that accepts frontend embeddings (webllm).
+const getBackendSource = () => settings.source === 'one-api' ? 'webllm' : settings.source;
+const isOneApiSource = () => settings.source === 'one-api';
+
 const settings = {
     // For both
     source: 'transformers',
@@ -71,6 +76,9 @@ const settings = {
     chutes_model: 'chutes-qwen-qwen3-embedding-8b',
     nanogpt_model: 'text-embedding-3-small',
     siliconflow_model: 'Qwen/Qwen3-Embedding-0.6B',
+    oneapi_url: 'https://api.openai.com/v1',
+    oneapi_key: '',
+    oneapi_model: 'text-embedding-3-small',
     summarize: false,
     summarize_sent: false,
     summary_source: 'main',
@@ -1304,7 +1312,7 @@ function getVectorsRequestBody(args = {}) {
             body.model = extension_settings.vectors.vllm_model;
             break;
         case 'webllm':
-            body.model = extension_settings.vectors.webllm_model;
+            body.model = isOneApiSource() ? extension_settings.vectors.oneapi_model : extension_settings.vectors.webllm_model;
             break;
         case 'palm':
             body.model = extension_settings.vectors.google_model;
@@ -1327,6 +1335,9 @@ function getVectorsRequestBody(args = {}) {
             body.model = extension_settings.vectors.siliconflow_model;
             body.siliconflow_endpoint = oai_settings.siliconflow_endpoint;
             break;
+        case 'one-api':
+            body.model = extension_settings.vectors.oneapi_model;
+            break;
         default:
             break;
     }
@@ -1340,6 +1351,11 @@ function getVectorsRequestBody(args = {}) {
  */
 async function getAdditionalArgs(items) {
     const args = {};
+    // One-API reuses webllm's frontend-embedding path to avoid ST backend changes
+    if (isOneApiSource()) {
+        args.embeddings = await createOneApiEmbeddings(items);
+        return args;
+    }
     switch (settings.source) {
         case 'webllm':
             args.embeddings = await createWebLlmEmbeddings(items);
@@ -1367,7 +1383,7 @@ async function getSavedHashes(collectionId) {
         body: JSON.stringify({
             ...getVectorsRequestBody(args),
             collectionId: collectionId,
-            source: settings.source,
+            source: getBackendSource(),
         }),
     });
 
@@ -1396,7 +1412,7 @@ async function insertVectorItems(collectionId, items) {
             ...getVectorsRequestBody(args),
             collectionId: collectionId,
             items: items,
-            source: settings.source,
+            source: getBackendSource(),
         }),
     });
 
@@ -1441,6 +1457,16 @@ function throwIfSourceInvalid() {
         throw new Error('Vectors: API model missing', { cause: 'api_model_missing' });
     }
 
+    if (settings.source === 'one-api' && !settings.oneapi_model) {
+        throw new Error('Vectors: API model missing', { cause: 'api_model_missing' });
+    }
+    if (settings.source === 'one-api' && !String(settings.oneapi_url || '').trim()) {
+        throw new Error('Vectors: API URL missing', { cause: 'api_url_missing' });
+    }
+    if (settings.source === 'one-api' && !String(settings.oneapi_key || '').trim()) {
+        throw new Error('Vectors: API key missing', { cause: 'api_key_missing' });
+    }
+
     if (settings.source === 'extras' && !modules.includes('embeddings')) {
         throw new Error('Vectors: Embeddings module missing', { cause: 'extras_module_missing' });
     }
@@ -1464,7 +1490,7 @@ async function deleteVectorItems(collectionId, hashes) {
             ...getVectorsRequestBody(),
             collectionId: collectionId,
             hashes: hashes,
-            source: settings.source,
+            source: getBackendSource(),
         }),
     });
 
@@ -1490,7 +1516,7 @@ async function queryCollection(collectionId, searchText, topK, thresholdOverride
             collectionId: collectionId,
             searchText: searchText,
             topK: topK,
-            source: settings.source,
+            source: getBackendSource(),
             threshold: thresholdOverride ?? settings.score_threshold,
         }),
     });
@@ -1520,7 +1546,7 @@ async function queryMultipleCollections(collectionIds, searchText, topK, thresho
             collectionIds: collectionIds,
             searchText: searchText,
             topK: topK,
-            source: settings.source,
+            source: getBackendSource(),
             threshold: threshold ?? settings.score_threshold,
         }),
     });
@@ -1804,6 +1830,7 @@ function toggleSettings() {
     $('#koboldcpp_vectorsModel').toggle(settings.source === 'koboldcpp');
     $('#google_vectorsModel').toggle(settings.source === 'palm' || settings.source === 'vertexai');
     $('#siliconflow_vectorsModel').toggle(settings.source === 'siliconflow');
+    $('#oneapi_vectorsModel').toggle(settings.source === 'one-api');
     $('#vector_altEndpointUrl').toggle(vectorApiRequiresUrl.includes(settings.source));
     switch (settings.source) {
         case 'webllm':
@@ -2113,6 +2140,79 @@ async function createKoboldCppEmbeddings(items) {
         embeddings: embeddings,
         model: data.model,
     };
+}
+
+/**
+ * Creates One-API (OpenAI-compatible) embeddings for a list of items.
+ * Frontend-direct to One-API /v1/embeddings, mirroring reranker pattern.
+ * @param {string[]} items Items to embed
+ * @returns {Promise<Record<string, number[]>>} Calculated embeddings mapped by text
+ */
+async function createOneApiEmbeddings(items) {
+    if (items.length === 0) {
+        return /** @type {Record<string, number[]>} */ ({});
+    }
+    const baseUrl = String(settings.oneapi_url || '').trim().replace(/\/+$/, '');
+    const apiKey = String(settings.oneapi_key || '').trim();
+    const model = String(settings.oneapi_model || '').trim();
+    if (!baseUrl) {
+        throw new Error('One-API URL is not set');
+    }
+    if (!model) {
+        throw new Error('One-API model is not set');
+    }
+    const headers = { 'Content-Type': 'application/json' };
+    if (apiKey) {
+        headers['Authorization'] = `Bearer ${apiKey}`;
+    }
+    const response = await fetch(`${baseUrl}/embeddings`, {
+        method: 'POST',
+        headers: headers,
+        body: JSON.stringify({
+            model: model,
+            input: items,
+        }),
+    });
+    if (!response.ok) {
+        const text = await response.text().catch(() => '');
+        throw new Error(`One-API embeddings failed: HTTP ${response.status} ${response.statusText} ${text.slice(0, 300)}`);
+    }
+    const data = await response.json();
+    if (!Array.isArray(data?.data)) {
+        throw new Error('One-API response missing data array');
+    }
+    data.data.sort((a, b) => a.index - b.index);
+    if (data.data.length !== items.length) {
+        throw new Error(`One-API returned ${data.data.length} embeddings for ${items.length} items`);
+    }
+    const embeddings = /** @type {Record<string, number[]>} */ ({});
+    for (let i = 0; i < data.data.length; i++) {
+        const embedding = data.data[i]?.embedding;
+        if (!Array.isArray(embedding) || embedding.length === 0) {
+            throw new Error('One-API returned an empty embedding');
+        }
+        embeddings[items[i]] = embedding;
+    }
+    return embeddings;
+}
+
+/**
+ * Tests One-API connectivity with a tiny embedding request.
+ * @returns {Promise<{ ok: boolean, message: string, ms: number }>}
+ */
+async function testOneApiConnection() {
+    const startedAt = Date.now();
+    try {
+        const embeddings = await createOneApiEmbeddings(['Hello world']);
+        const vector = Object.values(embeddings)[0];
+        const ms = Date.now() - startedAt;
+        if (!Array.isArray(vector) || vector.length === 0) {
+            return { ok: false, message: 'No embedding returned', ms };
+        }
+        return { ok: true, message: `One-API OK in ${ms}ms (dim=${vector.length}, model=${String(settings.oneapi_model || '').trim()})`, ms };
+    } catch (error) {
+        return { ok: false, message: `One-API test failed: ${error?.message || error}`, ms: Date.now() - startedAt };
+    }
 }
 
 async function onPurgeClick() {
@@ -2484,6 +2584,37 @@ jQuery(async () => {
         settings.siliconflow_model = String($('#vectors_siliconflow_model').val());
         Object.assign(extension_settings.vectors, settings);
         saveSettingsDebounced();
+    });
+    $('#vectors_oneapi_url').val(settings.oneapi_url).on('change', () => {
+        settings.oneapi_url = String($('#vectors_oneapi_url').val());
+        Object.assign(extension_settings.vectors, settings);
+        saveSettingsDebounced();
+    });
+    $('#vectors_oneapi_model').val(settings.oneapi_model).on('change', () => {
+        settings.oneapi_model = String($('#vectors_oneapi_model').val());
+        Object.assign(extension_settings.vectors, settings);
+        saveSettingsDebounced();
+    });
+    $('#vectors_oneapi_key').val(settings.oneapi_key).on('change', () => {
+        settings.oneapi_key = String($('#vectors_oneapi_key').val());
+        Object.assign(extension_settings.vectors, settings);
+        saveSettingsDebounced();
+    });
+    $('#vectors_oneapi_test').on('click', async () => {
+        const button = $('#vectors_oneapi_test');
+        button.addClass('busy');
+        try {
+            const result = await testOneApiConnection();
+            if (result.ok) {
+                toastr.success(result.message, 'One-API Test');
+                ragLogEvent('vectorize', 'info', `One-API test OK`, { ms: result.ms });
+            } else {
+                toastr.error(result.message, 'One-API Test');
+                ragLogEvent('vectorize', 'error', `One-API test failed: ${result.message}`);
+            }
+        } finally {
+            button.removeClass('busy');
+        }
     });
     $('#vectors_openrouter_model').val(settings.openrouter_model).on('change', () => {
         settings.openrouter_model = String($('#vectors_openrouter_model').val());
