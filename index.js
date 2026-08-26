@@ -2166,8 +2166,39 @@ function normalizeOneApiBaseUrl(url) {
 }
 
 /**
+ * Builds candidate endpoints for One-API embeddings.
+ * One-API/New-API is model-routed, so some deployments accept POST to the
+ * bare base URL (e.g. http://host:3000) and dispatch by `model` field,
+ * while standard OpenAI-compatible uses /v1/embeddings. Try bare first
+ * per user feedback, then fall back to OpenAI-standard paths.
+ * @param {string} rawUrl Raw URL from settings
+ * @returns {string[]} Candidate endpoints in priority order
+ */
+function getOneApiCandidateEndpoints(rawUrl) {
+    const raw = String(rawUrl || '').trim().replace(/\/+$/, '');
+    if (!raw) return [];
+    // Full endpoint already provided – use as-is
+    if (/\/embeddings$/i.test(raw)) {
+        return [raw];
+    }
+    const candidates = [];
+    // Per user request: try bare URL first (model-based routing)
+    candidates.push(raw);
+    if (/\/v1$/i.test(raw)) {
+        candidates.push(`${raw}/embeddings`);
+    } else {
+        candidates.push(`${raw}/v1/embeddings`);
+        candidates.push(`${raw}/embeddings`);
+        candidates.push(`${raw}/v1`);
+    }
+    // Deduplicate
+    return [...new Set(candidates)];
+}
+
+/**
  * Creates One-API (OpenAI-compatible) embeddings for a list of items.
- * Frontend-direct to One-API /v1/embeddings, mirroring reranker pattern.
+ * Frontend-direct to One-API, tries bare URL first (model-routed) then
+ * falls back to OpenAI-standard /v1/embeddings (mirrors reranker fallback).
  * @param {string[]} items Items to embed
  * @returns {Promise<Record<string, number[]>>} Calculated embeddings mapped by text
  */
@@ -2175,12 +2206,12 @@ async function createOneApiEmbeddings(items) {
     if (items.length === 0) {
         return /** @type {Record<string, number[]>} */ ({});
     }
-    const baseUrl = normalizeOneApiBaseUrl(settings.oneapi_url);
-    const apiKey = String(settings.oneapi_key || '').trim();
-    const model = String(settings.oneapi_model || '').trim();
-    if (!baseUrl) {
+    const rawUrl = String(settings.oneapi_url || '').trim();
+    if (!rawUrl) {
         throw new Error('One-API URL is not set');
     }
+    const apiKey = String(settings.oneapi_key || '').trim();
+    const model = String(settings.oneapi_model || '').trim();
     if (!model) {
         throw new Error('One-API model is not set');
     }
@@ -2188,54 +2219,73 @@ async function createOneApiEmbeddings(items) {
     if (apiKey) {
         headers['Authorization'] = `Bearer ${apiKey}`;
     }
-    const endpoint = `${baseUrl}/embeddings`;
-    let response;
-    try {
-        response = await fetch(endpoint, {
-            method: 'POST',
-            headers: headers,
-            body: JSON.stringify({
-                model: model,
-                input: items,
-            }),
-        });
-    } catch (error) {
-        // Network/CORS failure - fetch throws TypeError
-        const msg = String(error?.message || error);
-        throw new Error(`One-API network error fetching ${endpoint}: ${msg} — check URL reachable, CORS allowed, and One-API service is running`);
-    }
-    // Always read as text first so we can show raw body when server returns HTML (JSON.parse "<" error)
-    const rawText = await response.text().catch(() => '');
-    if (!response.ok) {
-        // Try to surface JSON error details if body is JSON, otherwise show raw preview (often HTML)
-        throw new Error(`One-API embeddings failed: HTTP ${response.status} ${response.statusText} at ${endpoint} — body: ${rawText.slice(0, 500)}`);
-    }
-    let data;
-    try {
-        data = rawText ? JSON.parse(rawText) : null;
-    } catch (parseError) {
-        const preview = rawText.slice(0, 500).replace(/\s+/g, ' ');
-        const hint = rawText.trim().startsWith('<')
-            ? 'Server returned HTML instead of JSON (often wrong URL, e.g. missing /v1, or One-API login page / Cloudflare challenge). Verify Endpoint URL ends with /v1'
-            : 'Server returned non-JSON';
-        throw new Error(`One-API returned non-JSON at ${endpoint}: ${hint}. Parse error: ${parseError?.message || parseError} — body preview: ${preview}`);
-    }
-    if (!Array.isArray(data?.data)) {
-        throw new Error(`One-API response missing data array at ${endpoint} — body: ${rawText.slice(0, 500)}`);
-    }
-    data.data.sort((a, b) => a.index - b.index);
-    if (data.data.length !== items.length) {
-        throw new Error(`One-API returned ${data.data.length} embeddings for ${items.length} items`);
-    }
-    const embeddings = /** @type {Record<string, number[]>} */ ({});
-    for (let i = 0; i < data.data.length; i++) {
-        const embedding = data.data[i]?.embedding;
-        if (!Array.isArray(embedding) || embedding.length === 0) {
-            throw new Error('One-API returned an empty embedding');
+    const payload = JSON.stringify({ model: model, input: items });
+    const candidates = getOneApiCandidateEndpoints(rawUrl);
+    let lastError = null;
+    let lastEndpoint = candidates[0] || rawUrl;
+    for (const endpoint of candidates) {
+        lastEndpoint = endpoint;
+        let response;
+        try {
+            response = await fetch(endpoint, {
+                method: 'POST',
+                headers: headers,
+                body: payload,
+            });
+        } catch (error) {
+            const msg = String(error?.message || error);
+            lastError = new Error(`One-API network error fetching ${endpoint}: ${msg} — check URL reachable, CORS allowed, and One-API service is running`);
+            continue;
         }
-        embeddings[items[i]] = embedding;
+        const rawText = await response.text().catch(() => '');
+        if (!response.ok) {
+            // If HTML error page, try next candidate; otherwise treat as retryable
+            const isHtml = rawText.trim().startsWith('<');
+            lastError = new Error(`One-API embeddings failed: HTTP ${response.status} ${response.statusText} at ${endpoint} — body: ${rawText.slice(0, 500)}`);
+            // 404/405 with HTML likely means wrong path – try next candidate
+            if (isHtml || response.status === 404 || response.status === 405) {
+                console.warn(`Vectors: One-API candidate ${endpoint} failed, trying next`, rawText.slice(0, 200));
+                continue;
+            }
+            throw lastError;
+        }
+        let data;
+        try {
+            data = rawText ? JSON.parse(rawText) : null;
+        } catch (parseError) {
+            const preview = rawText.slice(0, 500).replace(/\s+/g, ' ');
+            const isHtml = rawText.trim().startsWith('<');
+            lastError = new Error(`One-API returned non-JSON at ${endpoint}: ${isHtml ? 'Server returned HTML (wrong path?)' : 'Server returned non-JSON'}. Parse error: ${parseError?.message || parseError} — body preview: ${preview}`);
+            if (isHtml) {
+                console.warn(`Vectors: One-API candidate ${endpoint} returned HTML, trying next`);
+                continue;
+            }
+            throw lastError;
+        }
+        if (!Array.isArray(data?.data)) {
+            lastError = new Error(`One-API response missing data array at ${endpoint} — body: ${rawText.slice(0, 500)}`);
+            // Missing data array is likely a real API error (e.g. wrong model), not path – don't fallback blindly
+            throw lastError;
+        }
+        data.data.sort((a, b) => a.index - b.index);
+        if (data.data.length !== items.length) {
+            throw new Error(`One-API returned ${data.data.length} embeddings for ${items.length} items at ${endpoint}`);
+        }
+        const embeddings = /** @type {Record<string, number[]>} */ ({});
+        for (let i = 0; i < data.data.length; i++) {
+            const embedding = data.data[i]?.embedding;
+            if (!Array.isArray(embedding) || embedding.length === 0) {
+                throw new Error('One-API returned an empty embedding');
+            }
+            embeddings[items[i]] = embedding;
+        }
+        if (endpoint !== candidates[0]) {
+            console.log(`Vectors: One-API succeeded via fallback endpoint ${endpoint} (raw was ${rawUrl})`);
+        }
+        return embeddings;
     }
-    return embeddings;
+    // All candidates exhausted
+    throw lastError || new Error(`One-API embeddings failed at ${lastEndpoint}: no candidate succeeded`);
 }
 
 /**
@@ -2244,11 +2294,12 @@ async function createOneApiEmbeddings(items) {
  */
 async function testOneApiConnection() {
     const startedAt = Date.now();
-    const endpoint = `${normalizeOneApiBaseUrl(settings.oneapi_url)}/embeddings`;
+    const rawUrl = String(settings.oneapi_url || '').trim();
+    const candidates = getOneApiCandidateEndpoints(rawUrl);
+    const endpointHint = candidates[0] || rawUrl || '(empty)';
     try {
-        // Pre-flight validation for clearer messages
-        if (!String(settings.oneapi_url || '').trim()) {
-            return { ok: false, message: `One-API test failed: Endpoint URL is empty (expected e.g. https://api.openai.com/v1)`, ms: Date.now() - startedAt };
+        if (!rawUrl) {
+            return { ok: false, message: `One-API test failed: Endpoint URL is empty (expected e.g. https://api.openai.com/v1 or http://192.168.10.2:3000)`, ms: Date.now() - startedAt };
         }
         if (!String(settings.oneapi_model || '').trim()) {
             return { ok: false, message: `One-API test failed: Model ID is empty`, ms: Date.now() - startedAt };
@@ -2257,11 +2308,11 @@ async function testOneApiConnection() {
         const vector = Object.values(embeddings)[0];
         const ms = Date.now() - startedAt;
         if (!Array.isArray(vector) || vector.length === 0) {
-            return { ok: false, message: `No embedding returned from ${endpoint}`, ms };
+            return { ok: false, message: `No embedding returned from ${endpointHint}`, ms };
         }
-        return { ok: true, message: `One-API OK in ${ms}ms (dim=${vector.length}, model=${String(settings.oneapi_model || '').trim()}, endpoint=${endpoint})`, ms };
+        return { ok: true, message: `One-API OK in ${ms}ms (dim=${vector.length}, model=${String(settings.oneapi_model || '').trim()}, endpoint=${endpointHint})`, ms };
     } catch (error) {
-        console.error('Vectors: One-API test failed', { endpoint, error });
+        console.error('Vectors: One-API test failed', { rawUrl, candidates, error });
         return { ok: false, message: `One-API test failed: ${error?.message || error}`, ms: Date.now() - startedAt };
     }
 }
