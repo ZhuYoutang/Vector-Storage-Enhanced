@@ -199,6 +199,14 @@ const RERANK_PROBABILITY_MODELS = /qwen3?-rerank|minicpm|Qwen3?Rerank/i;
 /** Model-name hints for known families that return raw logits (need the sigmoid conversion). */
 const RERANK_LOGIT_MODELS = /jina|bge|gte|snowflake|cross-encoder|multilingual-e5|mxbai|answerai|all-minilm|gtr|llama/i;
 
+/**
+ * Absolute-probability floor for the best candidate in a batch. Below this the model is
+ * effectively uncalibrated (scores pinned near the sigmoid floor, e.g. some qwen3-reranker /
+ * llama.cpp builds), so only the relative order is trustworthy and the report shows a
+ * rank-relative view instead of a misleading "<0.001%".
+ */
+const RERANK_SATURATED_TOP_PROB = 0.01;
+
 /** Score mode decided for the most recent rerank batch; display helpers rely on it. */
 let lastRerankMode = RERANK_MODE_LOGIT;
 
@@ -306,6 +314,51 @@ function formatRerankScore(score) {
         return '-';
     }
     return `${formatProbability(rerankToProbability(score))} (raw ${formatRawScore(score)})`;
+}
+
+/**
+ * Computes batch-level stats needed to render rerank scores honestly. When the best
+ * candidate's probability is below the saturation floor the model is uncalibrated for this
+ * batch (every score pinned near 0), so the report falls back to a rank-relative view.
+ * @param {{rerankScore: number|null|undefined}[]} candidates
+ * @returns {{calibrated: boolean, scoreMin: number, scoreMax: number, span: number}}
+ */
+function computeRerankBatchStats(candidates) {
+    const scores = (candidates || []).map(c => c.rerankScore).filter(Number.isFinite);
+    if (!scores.length) {
+        return { calibrated: true, scoreMin: Number.NaN, scoreMax: Number.NaN, span: 0 };
+    }
+    const scoreMin = Math.min(...scores);
+    const scoreMax = Math.max(...scores);
+    const topProb = rerankToProbability(scoreMax);
+    return {
+        calibrated: Number.isFinite(topProb) && topProb >= RERANK_SATURATED_TOP_PROB,
+        scoreMin,
+        scoreMax,
+        span: scoreMax - scoreMin,
+    };
+}
+
+/**
+ * Formats a rerank score for the report table. Calibrated batches show the absolute
+ * relevance probability (e.g. jina's sigmoid logits); saturated batches show each
+ * candidate's rank within the batch (best = 100%) with the raw value alongside.
+ * @param {number|null|undefined} score Raw reranker score
+ * @param {{calibrated: boolean, scoreMin: number, scoreMax: number, span: number}} stats
+ * @returns {string}
+ */
+function formatRerankCell(score, stats) {
+    if (!Number.isFinite(score)) {
+        return '-';
+    }
+    if (stats.calibrated) {
+        return formatRerankPercent(score);
+    }
+    if (stats.span > 0 && Number.isFinite(stats.scoreMin) && Number.isFinite(stats.scoreMax)) {
+        const rel = Math.round((score - stats.scoreMin) / stats.span * 100);
+        return `${rel}% (raw ${formatRawScore(score)})`;
+    }
+    return `${formatRerankPercent(score)} (raw ${formatRawScore(score)})`;
 }
 
 /**
@@ -422,9 +475,12 @@ function recordRecallReport(report) {
     // All report-producing paths go through getRecallParams, which forces the recall
     // threshold to 0 exactly when the reranker is active and "ignore threshold" is set.
     report.thresholdIgnored = shouldRerank() && !!settings.rerank_ignore_threshold;
+    report.scoreMode = lastRerankMode;
 
     const topScore = report.reranked ? (report.candidates?.[0]?.rerankScore ?? null) : null;
-    const allWeak = Number.isFinite(topScore) && rerankToProbability(topScore) < 0.5;
+    const batchStats = computeRerankBatchStats(report.candidates);
+    // Only flag "all weak" when the model is calibrated enough for absolute % to mean anything.
+    const allWeak = Number.isFinite(topScore) && batchStats.calibrated && rerankToProbability(topScore) < 0.5;
 
     updateStatusBadge(allWeak
         ? `⚠ ${report.finalCount ?? 0} injected · all weak (top ${formatRerankPercent(topScore)})`
@@ -437,6 +493,8 @@ function recordRecallReport(report) {
     });
     if (allWeak) {
         ragLogEvent(report.path, 'warn', `All reranked candidates weakly relevant (best raw ${formatRawScore(topScore)} = ${formatRerankPercent(topScore)}). Check recall pool/query text.`, { topScore: topScore });
+    } else if (report.reranked && !batchStats.calibrated && Number.isFinite(batchStats.scoreMax)) {
+        ragLogEvent(report.path, 'warn', `Reranker scores look saturated (best prob ${formatRerankPercent(batchStats.scoreMax)}). Only the ordering is reliable; absolute % is meaningless for this model/batch.`, { bestProb: batchStats.scoreMax });
     }
     renderLastReport();
     saveRagLogDebounced();
@@ -466,6 +524,13 @@ function renderLastReport() {
     }
 
     const r = lastRecallReport;
+
+    // Render with the score mode that produced this report (survives reloads / model switches).
+    const prevMode = lastRerankMode;
+    if (r.scoreMode === RERANK_MODE_LOGIT || r.scoreMode === RERANK_MODE_PROBABILITY) {
+        lastRerankMode = r.scoreMode;
+    }
+
     const thresholdLabel = r.thresholdIgnored
         ? `${r.threshold} <i>(forced 0 — reranker decides)</i>`
         : `${r.threshold} <i>(recall pre-filter)</i>`;
@@ -478,19 +543,25 @@ function renderLastReport() {
         `<div class="rag-report-killed">[killed by threshold] ${escapeHtml(k)}</div>`).join('');
 
     const topScore = r.reranked ? (r.candidates?.[0]?.rerankScore ?? null) : null;
-    const weakBanner = Number.isFinite(topScore) && rerankToProbability(topScore) < 0.5
+    const batchStats = computeRerankBatchStats(r.candidates);
+    const weakBanner = Number.isFinite(topScore) && batchStats.calibrated && rerankToProbability(topScore) < 0.5
         ? `<div class="rag-report-killed">⚠ all candidates weakly relevant (best: ${formatRerankScore(topScore)})</div>`
+        : '';
+    const satNote = r.reranked && !batchStats.calibrated && Number.isFinite(batchStats.scoreMax)
+        ? `<div class="rag-report-killed" title="The model returned near-zero probabilities for every candidate, so absolute % would be meaningless. The table shows each candidate's rank within this batch (best = 100%) instead.">ℹ scores saturated (best ${formatRerankPercent(batchStats.scoreMax)}) · showing rank within batch</div>`
         : '';
 
     const rows = (r.candidates || []).map(c => {
         const status = c.inserted ? '<b style="color:var(--okGreen)">INSERTED</b>' : `cut (${c.reason})`;
-        return `<tr><td>${c.rank}</td><td>${escapeHtml(formatRerankScore(c.rerankScore))}</td><td>${status}</td><td class="rag-report-text">${escapeHtml(c.text)}</td></tr>`;
+        return `<tr><td>${c.rank}</td><td>${escapeHtml(formatRerankCell(c.rerankScore, batchStats))}</td><td>${status}</td><td class="rag-report-text">${escapeHtml(c.text)}</td></tr>`;
     }).join('');
     const table = rows
         ? `<table class="rag-report-table"><thead><tr><th>#</th><th>rerank</th><th>status</th><th>text preview</th></tr></thead><tbody>${rows}</tbody></table>`
         : '<small>(no candidates returned)</small>';
 
-    container.html(head + weakBanner + killedRows + table);
+    container.html(head + satNote + weakBanner + killedRows + table);
+
+    lastRerankMode = prevMode;
 }
 
 /**
@@ -1725,6 +1796,9 @@ function getRecallParams(finalCount) {
 
 let rerankWarnedOnce = false;
 
+/** One-time flag for the "scores look saturated/uncalibrated" hint. */
+let rerankSaturatedWarnedOnce = false;
+
 /**
  * Reranks candidate texts against a query using an external /v1/rerank endpoint
  * (llama.cpp server style; also compatible with TEI/Jina-style responses).
@@ -1839,6 +1913,23 @@ async function rerankTexts(queryText, texts, force = false) {
             topScorePct: formatRerankPercent(scored[0]?.score),
             scoreMode: lastRerankMode,
         });
+
+        // Detect degenerate output: every score pinned near the sigmoid floor means the model
+        // is uncalibrated for this batch (seen with some qwen3-reranker / llama.cpp builds).
+        // Only the ordering is then reliable, so surface a one-time hint instead of silently
+        // showing meaningless absolute percentages.
+        const topProb = rerankToProbability(scored[0]?.score);
+        const saturated = Number.isFinite(topProb) && topProb < RERANK_SATURATED_TOP_PROB;
+        if (saturated) {
+            if (!rerankSaturatedWarnedOnce) {
+                rerankSaturatedWarnedOnce = true;
+                ragLogEvent('rerank', 'warn', `Reranker scores look saturated (best prob ${formatRerankPercent(scored[0]?.score)}). Absolute % is meaningless; only ordering is reliable. Check the model/template.`, { bestProb: scored[0]?.score });
+                toastr.warning('Reranker scores look saturated (near-zero). Only ordering is reliable — check the model/template.', 'Vector Storage');
+            }
+        } else {
+            rerankSaturatedWarnedOnce = false;
+        }
+
         rerankWarnedOnce = false;
         return scored;
     } catch (error) {
