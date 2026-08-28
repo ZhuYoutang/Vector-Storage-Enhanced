@@ -563,6 +563,24 @@
                     </div>
                 </div>
                 <div class="flex-container">
+                    <div class="flex1" title="How the /v1/rerank endpoint reports relevance. Auto-detect inspects the returned scores (all within 0..1 = already probabilities, e.g. qwen3-reranker via llama.cpp; otherwise raw logits, e.g. jina/BGE). Pick a fixed mode if Auto guesses wrong — it is remembered per model id.">
+                        <label for="vectors_rerank_score_mode">
+                            <small data-i18n="Rerank Score Scale">Score scale</small>
+                        </label>
+                        <select id="vectors_rerank_score_mode" class="text_pole">
+                            <option value="auto">Auto-detect</option>
+                            <option value="logit">Logits (sigmoid, jina/BGE)</option>
+                            <option value="probability">Probabilities (0–1, qwen3)</option>
+                        </select>
+                    </div>
+                    <div class="flex1" title="Leave Auto-detect enabled unless it misreads your model. qwen3-reranker and other sigmoid-output models already return 0..1 probabilities; jina/BGE/GT E return raw logits that are converted with the logistic function.">
+                        <label>
+                            <small>Hint</small>
+                        </label>
+                        <div class="vectors_rerank_mode_hint">Auto: qwen3 → 0–1, jina/BGE → logit</div>
+                    </div>
+                </div>
+                <div class="flex-container">
                     <div class="flex1" title="Optional API key, sent as a Bearer token. Leave empty for local servers.">
                         <label for="vectors_rerank_key">
                             <small data-i18n="API Key">API key (optional)</small>

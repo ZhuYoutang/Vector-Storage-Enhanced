@@ -130,6 +130,10 @@ const settings = {
     rerank_query_max_chars: 2000,
     rerank_doc_max_chars: 1600,
     rerank_timeout_ms: 60000,
+    // Score scale of the /v1/rerank response, keyed by model id. Values: 'auto' | 'logit' | 'probability'.
+    // 'auto' detects from the returned scores (all within [0,1] -> probabilities, else raw logits).
+    // 'logit' applies sigmoid (jina/BGE/GT E style); 'probability' uses scores as-is (qwen3-reranker style).
+    rerank_score_mode: {},
 
     // For Diagnostics
     debug_enabled: true,
@@ -181,9 +185,26 @@ function updateStatusBadge(text, level = 'info') {
     badge.toggleClass('rag-badge-err', level === 'error');
 }
 
+/** Reranker score modes: how the /v1/rerank endpoint reports relevance. */
+const RERANK_MODE_AUTO = 'auto';
+const RERANK_MODE_LOGIT = 'logit';
+const RERANK_MODE_PROBABILITY = 'probability';
+
+/** Fallback key in settings.rerank_score_mode used when no model id is configured. */
+const RERANK_MODE_DEFAULT_KEY = '__default__';
+
+/** Model-name hints for known families that return sigmoid probabilities instead of raw logits. */
+const RERANK_PROBABILITY_MODELS = /qwen3?-rerank|minicpm|Qwen3?Rerank/i;
+
+/** Model-name hints for known families that return raw logits (need the sigmoid conversion). */
+const RERANK_LOGIT_MODELS = /jina|bge|gte|snowflake|cross-encoder|multilingual-e5|mxbai|answerai|all-minilm|gtr|llama/i;
+
+/** Score mode decided for the most recent rerank batch; display helpers rely on it. */
+let lastRerankMode = RERANK_MODE_LOGIT;
+
 /**
- * Logistic function used to map raw reranker logits to a [0, 1] relevance probability.
- * llama.cpp-style backends return unnormalized logits, so percentages need this conversion.
+ * Logistic function used to map a raw reranker logit to a [0, 1] relevance probability.
+ * llama.cpp-style backends return unnormalized logits, so probabilities need this conversion.
  * @param {number} x Raw logit
  * @returns {number} Value in (0, 1)
  */
@@ -192,7 +213,91 @@ function sigmoid(x) {
 }
 
 /**
- * Formats a raw reranker score for display as "raw (sigmoid%)".
+ * Resolves the effective score mode for a model, honouring the per-model override first,
+ * then model-name hints. 'auto' means "decide from the returned values at request time".
+ * @param {string} [model] Configured model id
+ * @returns {'auto'|'logit'|'probability'}
+ */
+function resolveRerankMode(model) {
+    const key = (model && String(model).trim()) || RERANK_MODE_DEFAULT_KEY;
+    const override = settings.rerank_score_mode?.[key];
+    if (override === RERANK_MODE_LOGIT || override === RERANK_MODE_PROBABILITY) {
+        return override;
+    }
+    const name = String(model || '');
+    if (RERANK_PROBABILITY_MODELS.test(name)) {
+        return RERANK_MODE_PROBABILITY;
+    }
+    if (RERANK_LOGIT_MODELS.test(name)) {
+        return RERANK_MODE_LOGIT;
+    }
+    return RERANK_MODE_AUTO;
+}
+
+/**
+ * Detects the score scale of a reranker response by inspecting the returned scores.
+ * All values within [0, 1] -> probabilities (already sigmoid-applied); any value < 0
+ * or > 1 -> raw logits (jina/BGE style).
+ * @param {number[]} scores Non-empty list of numeric relevance scores
+ * @returns {'logit'|'probability'}
+ */
+function detectRerankModeFromScores(scores) {
+    return scores.every(s => s >= 0 && s <= 1) ? RERANK_MODE_PROBABILITY : RERANK_MODE_LOGIT;
+}
+
+/**
+ * Converts a raw reranker score to a [0, 1] relevance probability, honouring the active
+ * score mode. Logits are passed through the logistic function; probabilities are used as-is.
+ * @param {number} score Raw reranker score
+ * @returns {number} Relevance probability in (0, 1)
+ */
+function rerankToProbability(score) {
+    if (!Number.isFinite(score)) {
+        return Number.NaN;
+    }
+    return lastRerankMode === RERANK_MODE_LOGIT ? sigmoid(score) : score;
+}
+
+/**
+ * Formats a reranker probability for display with adaptive precision.
+ * @param {number} probability Value in (0, 1)
+ * @returns {string} e.g. "97.9%", "0.009%", "<0.001%"
+ */
+function formatProbability(probability) {
+    if (!Number.isFinite(probability)) {
+        return '-';
+    }
+    const pct = Math.max(0, Math.min(probability, 1)) * 100;
+    if (pct <= 0) {
+        return '0%';
+    }
+    if (pct < 0.001) {
+        return '<0.001%';
+    }
+    return `${pct < 0.01 ? pct.toFixed(3) : pct.toFixed(1)}%`;
+}
+
+/**
+ * Formats a raw reranker score compactly (fixed-point where reasonable, else scientific).
+ * @param {number} score Raw reranker score
+ * @returns {string} Compact numeric string
+ */
+function formatRawScore(score) {
+    if (!Number.isFinite(score)) {
+        return '-';
+    }
+    if (score === 0) {
+        return '0';
+    }
+    const abs = Math.abs(score);
+    if (abs >= 0.001 && abs < 100000) {
+        return String(Number(score.toFixed(3)));
+    }
+    return score.toExponential(2);
+}
+
+/**
+ * Formats a raw reranker score for display as "probability% (raw score)".
  * @param {number|null|undefined} score Raw relevance score
  * @returns {string} Human readable score, '-' when unavailable
  */
@@ -200,19 +305,57 @@ function formatRerankScore(score) {
     if (!Number.isFinite(score)) {
         return '-';
     }
-    return `${score.toFixed(3)} (${(sigmoid(score) * 100).toFixed(1)}%)`;
+    return `${formatProbability(rerankToProbability(score))} (raw ${formatRawScore(score)})`;
 }
 
 /**
- * Formats just the sigmoid percentage of a raw reranker score.
+ * Formats just the relevance percentage of a raw reranker score.
  * @param {number|null|undefined} score Raw relevance score
  * @returns {string} Percentage string, '-' when unavailable
  */
-function formatSigmoidPercent(score) {
+function formatRerankPercent(score) {
     if (!Number.isFinite(score)) {
         return '-';
     }
-    return `${(sigmoid(score) * 100).toFixed(1)}%`;
+    return formatProbability(rerankToProbability(score));
+}
+
+/**
+ * Returns the saved score-mode override for a model id ('auto' when unset).
+ * @param {string} [model] Configured model id
+ * @returns {'auto'|'logit'|'probability'}
+ */
+function getRerankScoreModeSetting(model) {
+    const key = (model && String(model).trim()) || RERANK_MODE_DEFAULT_KEY;
+    const mode = settings.rerank_score_mode?.[key];
+    return (mode === RERANK_MODE_LOGIT || mode === RERANK_MODE_PROBABILITY) ? mode : RERANK_MODE_AUTO;
+}
+
+/**
+ * Persists the score-mode override for a model id. Remembered per model so switching
+ * rerankers (jina, qwen3, ...) never needs the code touched again.
+ * @param {string} [model] Configured model id
+ * @param {'auto'|'logit'|'probability'} mode Selected mode
+ */
+function setRerankScoreModeSetting(model, mode) {
+    const key = (model && String(model).trim()) || RERANK_MODE_DEFAULT_KEY;
+    if (!settings.rerank_score_mode || typeof settings.rerank_score_mode !== 'object') {
+        settings.rerank_score_mode = {};
+    }
+    settings.rerank_score_mode[key] = (mode === RERANK_MODE_LOGIT || mode === RERANK_MODE_PROBABILITY) ? mode : RERANK_MODE_AUTO;
+    Object.assign(extension_settings.vectors, settings);
+    saveSettingsDebounced();
+}
+
+/**
+ * Reflects the saved score-mode override for a model id into the settings dropdown.
+ * @param {string} [model] Configured model id
+ */
+function syncRerankScoreModeSelect(model) {
+    const select = $('#vectors_rerank_score_mode');
+    if (select.length) {
+        select.val(getRerankScoreModeSetting(model));
+    }
 }
 
 /**
@@ -281,10 +424,10 @@ function recordRecallReport(report) {
     report.thresholdIgnored = shouldRerank() && !!settings.rerank_ignore_threshold;
 
     const topScore = report.reranked ? (report.candidates?.[0]?.rerankScore ?? null) : null;
-    const allWeak = Number.isFinite(topScore) && sigmoid(topScore) < 0.5;
+    const allWeak = Number.isFinite(topScore) && rerankToProbability(topScore) < 0.5;
 
     updateStatusBadge(allWeak
-        ? `⚠ ${report.finalCount ?? 0} injected · all weak (top ${formatSigmoidPercent(topScore)})`
+        ? `⚠ ${report.finalCount ?? 0} injected · all weak (top ${formatRerankPercent(topScore)})`
         : `✓ ${report.finalCount ?? 0} injected (${report.tookMs ?? '?'}ms)`, allWeak ? 'warn' : 'info');
     ragLogEvent(report.path, 'info', `Recall: ${report.candidates?.length ?? 0} candidates -> ${report.finalCount ?? 0} final` +
         `${report.reranked ? ' [reranked]' : ''}`, {
@@ -293,7 +436,7 @@ function recordRecallReport(report) {
         tookMs: report.tookMs,
     });
     if (allWeak) {
-        ragLogEvent(report.path, 'warn', `All reranked candidates weakly relevant (best raw ${topScore.toFixed(3)} = ${formatSigmoidPercent(topScore)}). Check recall pool/query text.`, { topScore: topScore });
+        ragLogEvent(report.path, 'warn', `All reranked candidates weakly relevant (best raw ${formatRawScore(topScore)} = ${formatRerankPercent(topScore)}). Check recall pool/query text.`, { topScore: topScore });
     }
     renderLastReport();
     saveRagLogDebounced();
@@ -335,7 +478,7 @@ function renderLastReport() {
         `<div class="rag-report-killed">[killed by threshold] ${escapeHtml(k)}</div>`).join('');
 
     const topScore = r.reranked ? (r.candidates?.[0]?.rerankScore ?? null) : null;
-    const weakBanner = Number.isFinite(topScore) && sigmoid(topScore) < 0.5
+    const weakBanner = Number.isFinite(topScore) && rerankToProbability(topScore) < 0.5
         ? `<div class="rag-report-killed">⚠ all candidates weakly relevant (best: ${formatRerankScore(topScore)})</div>`
         : '';
 
@@ -1663,6 +1806,17 @@ async function rerankTexts(queryText, texts, force = false) {
             .filter(x => Number.isInteger(x.index) && x.index >= 0 && x.index < texts.length)
             .map(x => ({ index: x.index, score: Number.isFinite(x.score) ? x.score : null }));
 
+        // Resolve the score scale for this batch: per-model override wins, then model-name
+        // hints, then a range heuristic over the actual returned values. 'probability' models
+        // (e.g. qwen3-reranker via llama.cpp) already return sigmoid-applied scores in [0, 1],
+        // while 'logit' models (e.g. jina/BGE) return unbounded raw logits that need sigmoid.
+        const numericScores = scored.map(x => x.score).filter(Number.isFinite);
+        let batchMode = resolveRerankMode(String(settings.rerank_model || '').trim());
+        if (batchMode === RERANK_MODE_AUTO) {
+            batchMode = numericScores.length ? detectRerankModeFromScores(numericScores) : lastRerankMode;
+        }
+        lastRerankMode = batchMode;
+
         // Append anything the API skipped, preserving the original order at the end
         const seen = new Set(scored.map(x => x.index));
         for (let index = 0; index < texts.length; index++) {
@@ -1682,7 +1836,8 @@ async function rerankTexts(queryText, texts, force = false) {
 
         ragLogEvent('rerank', 'info', `Reranked ${texts.length} docs in ${Date.now() - startedAt}ms`, {
             topScore: scored[0]?.score,
-            topSigmoidPct: formatSigmoidPercent(scored[0]?.score),
+            topScorePct: formatRerankPercent(scored[0]?.score),
+            scoreMode: lastRerankMode,
         });
         rerankWarnedOnce = false;
         return scored;
@@ -1714,7 +1869,9 @@ async function testRerankerConnection() {
             'The Eiffel Tower is located in Paris.',
         ], true);
         const ms = Date.now() - startedAt;
-        const topText = ordered[0]?.score !== null ? `top score ${ordered[0].score.toFixed(3)}` : 'no scores returned';
+        const topText = ordered[0]?.score !== null
+            ? `top score ${formatRawScore(ordered[0].score)} (${formatRerankPercent(ordered[0].score)}, ${lastRerankMode} mode)`
+            : 'no scores returned';
         return { ok: ordered[0]?.score !== null, message: `Reranker responded in ${ms}ms (${topText})`, ms };
     } catch (error) {
         return { ok: false, message: `Reranker test failed: ${error?.message || error}`, ms: Date.now() - startedAt };
@@ -2949,6 +3106,10 @@ jQuery(async () => {
         settings.rerank_model = String($('#vectors_rerank_model').val());
         Object.assign(extension_settings.vectors, settings);
         saveSettingsDebounced();
+        syncRerankScoreModeSelect(settings.rerank_model);
+    });
+    $('#vectors_rerank_score_mode').val(getRerankScoreModeSetting(settings.rerank_model)).on('change', () => {
+        setRerankScoreModeSetting(settings.rerank_model, String($('#vectors_rerank_score_mode').val() || 'auto'));
     });
     $('#vectors_rerank_recall').val(settings.rerank_recall).on('input', () => {
         settings.rerank_recall = Number($('#vectors_rerank_recall').val());

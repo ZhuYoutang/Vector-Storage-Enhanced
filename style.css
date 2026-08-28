@@ -101,3 +101,10 @@
     word-break: break-word;
     max-width: 320px;
 }
+
+.vectors_rerank_mode_hint {
+    opacity: 0.6;
+    font-size: 0.85em;
+    line-height: 1.4;
+    padding-top: 4px;
+}
