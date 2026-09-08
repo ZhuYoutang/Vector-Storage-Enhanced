@@ -93,6 +93,7 @@ const settings = {
     protect: 5,
     insert: 3,
     query: 2,
+    query_max_chars: 0,
     message_chunk_size: 400,
     score_threshold: 0.25,
 
@@ -1481,9 +1482,15 @@ async function getQueryText(chat, initiator) {
         hashedMessages = await summarize(hashedMessages, settings.summary_source);
     }
 
-    const queryText = hashedMessages.map(x => x.text).join('\n');
+    let queryText = hashedMessages.map(x => x.text).join('\n');
+    queryText = collapseNewlines(queryText).trim();
 
-    return collapseNewlines(queryText).trim();
+    const maxChars = Number(settings.query_max_chars);
+    if (Number.isFinite(maxChars) && maxChars > 0 && queryText.length > maxChars) {
+        queryText = queryText.slice(-maxChars);
+    }
+
+    return queryText;
 }
 
 /**
@@ -3020,6 +3027,11 @@ jQuery(async () => {
     });
     $('#vectors_query').val(settings.query).on('input', () => {
         settings.query = Number($('#vectors_query').val());
+        Object.assign(extension_settings.vectors, settings);
+        saveSettingsDebounced();
+    });
+    $('#vectors_query_max_chars').val(settings.query_max_chars).on('input', () => {
+        settings.query_max_chars = Number($('#vectors_query_max_chars').val());
         Object.assign(extension_settings.vectors, settings);
         saveSettingsDebounced();
     });
