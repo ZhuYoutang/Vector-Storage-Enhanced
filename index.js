@@ -135,6 +135,9 @@ const settings = {
     // 'auto' detects from the returned scores (all within [0,1] -> probabilities, else raw logits).
     // 'logit' applies sigmoid (jina/BGE/GT E style); 'probability' uses scores as-is (qwen3-reranker style).
     rerank_score_mode: {},
+    // Only used when the user explicitly selects the probability score scale.
+    rerank_probability_threshold: 0,
+    rerank_ignore_max_entries: false,
 
     // For Diagnostics
     debug_enabled: true,
@@ -410,6 +413,46 @@ function syncRerankScoreModeSelect(model) {
     if (select.length) {
         select.val(getRerankScoreModeSetting(model));
     }
+    $('#vectors_rerank_probability_settings').toggle(getRerankScoreModeSetting(model) === RERANK_MODE_PROBABILITY);
+}
+
+/** Returns a valid probability threshold, including for older or manually edited settings. */
+function getRerankProbabilityThreshold() {
+    const threshold = Number(settings.rerank_probability_threshold);
+    return Number.isFinite(threshold) ? Math.max(0, Math.min(1, threshold)) : 0;
+}
+
+/**
+ * Decides which ranked candidates to inject, keeping rejected entries for diagnostics.
+ * Probability-only options require an explicit probability scale and a scored response.
+ * A failed/unscored rerank retains the original count-limited fallback.
+ * @param {{ index: number, score: number | null }[]} rankedOrder
+ * @param {number} finalCount
+ * @returns {{ index: number, score: number | null, rank: number, inserted: boolean, reason: string }[]}
+ */
+function selectRerankedCandidates(rankedOrder, finalCount) {
+    const filterByProbability = shouldRerank()
+        && getRerankScoreModeSetting(settings.rerank_model) === RERANK_MODE_PROBABILITY
+        && rankedOrder.some(entry => Number.isFinite(entry.score));
+    const threshold = getRerankProbabilityThreshold();
+    const ignoreMaxEntries = filterByProbability && settings.rerank_ignore_max_entries;
+    let insertedCount = 0;
+
+    return rankedOrder.map((entry, rank) => {
+        let reason = '';
+        if (filterByProbability && (!Number.isFinite(entry.score) || entry.score < 0 || entry.score > 1)) {
+            reason = '缺少有效概率分数';
+        } else if (filterByProbability && entry.score < threshold) {
+            reason = `低于概率阈值（${formatProbability(threshold)}）`;
+        } else if (!ignoreMaxEntries && insertedCount >= finalCount) {
+            reason = '超出最大条目数';
+        }
+        const inserted = !reason;
+        if (inserted) {
+            insertedCount++;
+        }
+        return { ...entry, rank, inserted, reason };
+    });
 }
 
 /**
@@ -1085,16 +1128,17 @@ async function injectDataBankChunks(queryText, collectionIds) {
         let finalCandidates = [];
 
         if (shouldRerank()) {
-            // Rerank the whole pooled candidate set, then keep only the final count
+            // Apply the shared probability/count policy to the whole candidate pool.
             const rerankedOrder = await rerankTexts(queryText, pooledTexts);
-            finalCandidates = rerankedOrder.map((entry, rank) => ({
-                rank: rank,
+            const selectedOrder = selectRerankedCandidates(rerankedOrder, settings.chunk_count_db);
+            finalCandidates = selectedOrder.map(entry => ({
+                rank: entry.rank,
                 rerankScore: entry.score,
-                inserted: rank < settings.chunk_count_db,
-                reason: rank < settings.chunk_count_db ? '' : 'final count cut',
+                inserted: entry.inserted,
+                reason: entry.reason,
                 text: String(pooledTexts[entry.index] ?? '').slice(0, RAG_LOG_PREVIEW_LENGTH),
             }));
-            textResult = rerankedOrder.slice(0, settings.chunk_count_db).map(x => pooledTexts[x.index]).join('\n') + '\n\n';
+            textResult = selectedOrder.filter(x => x.inserted).map(x => pooledTexts[x.index]).join('\n') + '\n\n';
         } else {
             finalCandidates = pooledTexts.map((text, rank) => ({ rank: rank, rerankScore: null, inserted: true, reason: '', text: String(text).slice(0, RAG_LOG_PREVIEW_LENGTH) }));
             textResult = pooledTexts.join('');
@@ -1151,14 +1195,15 @@ async function retrieveFileChunks(queryText, collectionId) {
 
     if (shouldRerank()) {
         const rerankedOrder = await rerankTexts(queryText, metadata);
-        finalCandidates = rerankedOrder.map((entry, rank) => ({
-            rank: rank,
+        const selectedOrder = selectRerankedCandidates(rerankedOrder, settings.chunk_count);
+        finalCandidates = selectedOrder.map(entry => ({
+            rank: entry.rank,
             rerankScore: entry.score,
-            inserted: rank < settings.chunk_count,
-            reason: rank < settings.chunk_count ? '' : 'final count cut',
+            inserted: entry.inserted,
+            reason: entry.reason,
             text: String(metadata[entry.index] ?? '').slice(0, RAG_LOG_PREVIEW_LENGTH),
         }));
-        fileText = rerankedOrder.slice(0, settings.chunk_count).map(x => metadata[x.index]).join('\n');
+        fileText = selectedOrder.filter(x => x.inserted).map(x => metadata[x.index]).join('\n');
     } else {
         finalCandidates = metadata.map((text, rank) => ({ rank: rank, rerankScore: null, inserted: true, reason: '', text: String(text).slice(0, RAG_LOG_PREVIEW_LENGTH) }));
         fileText = metadata.join('\n');
@@ -1356,14 +1401,16 @@ async function rearrangeChat(chat, _contextSize, _abort, type) {
             }
         }
 
-        // Rerank candidates against the query, then keep only the final count
+        // Rerank candidates, then apply probability filtering and the optional count limit.
         const rerankedOrder = await rerankTexts(queryText, candidateMessages.map(c => collapseNewlines(String(c.message.mes)).trim()));
-        const rankedCandidates = rerankedOrder.map((entry, rank) => ({
+        const rankedCandidates = selectRerankedCandidates(rerankedOrder, settings.insert).map(entry => ({
             ...candidateMessages[entry.index],
             rerankScore: entry.score,
-            rank: rank,
+            rank: entry.rank,
+            inserted: entry.inserted,
+            reason: entry.reason,
         }));
-        const finalCandidates = rankedCandidates.slice(0, settings.insert);
+        const finalCandidates = rankedCandidates.filter(c => c.inserted);
         const insertedHashes = new Set(finalCandidates.map(c => c.hash));
 
         const queriedMessages = [];
@@ -1399,15 +1446,15 @@ async function rearrangeChat(chat, _contextSize, _abort, type) {
                 rank: c.rank,
                 rerankScore: c.rerankScore,
                 inserted: insertedHashes.has(c.hash),
-                reason: insertedHashes.has(c.hash) ? '' : 'final count cut',
+                reason: c.reason,
                 text: collapseNewlines(String(c.message.mes)).trim().slice(0, RAG_LOG_PREVIEW_LENGTH),
             })),
         });
 
         // Remove queried messages from the original chat array
-        for (const message of chat) {
-            if (queriedMessages.includes(message)) {
-                chat.splice(chat.indexOf(message), 1);
+        for (let index = chat.length - 1; index >= 0; index--) {
+            if (queriedMessages.includes(chat[index])) {
+                chat.splice(index, 1);
             }
         }
 
@@ -1817,7 +1864,8 @@ let rerankSaturatedWarnedOnce = false;
  */
 async function rerankTexts(queryText, texts, force = false) {
     const originalOrder = texts.map((_, index) => ({ index, score: null }));
-    if ((!shouldRerank() && !force) || texts.length <= 1) {
+    const needsProbabilityScore = getRerankScoreModeSetting(settings.rerank_model) === RERANK_MODE_PROBABILITY;
+    if ((!shouldRerank() && !force) || texts.length === 0 || (texts.length === 1 && !needsProbabilityScore)) {
         return originalOrder;
     }
 
@@ -1855,7 +1903,7 @@ async function rerankTexts(queryText, texts, force = false) {
 
     const startedAt = Date.now();
     const totalChars = trimmedQuery.length + boundedDocs.reduce((sum, doc) => sum + doc.length, 0);
-    ragLogEvent('rerank', 'info', `Dispatching ${boundedDocs.length} pairs (~${Math.round(totalChars / 1000)}k chars total)`, { timeoutMs: timeoutMs || 'none' });
+    ragLogEvent('rerank', 'info', `正在精排 ${boundedDocs.length} 个候选（总计约 ${Math.round(totalChars / 1000)} 千字符）`, { timeoutMs: timeoutMs || 'none' });
 
     try {
         const response = await fetch(`${baseUrl}/v1/rerank`, {
@@ -1877,7 +1925,7 @@ async function rerankTexts(queryText, texts, force = false) {
         const data = await response.json();
         const results = Array.isArray(data?.results) ? data.results : [];
         if (!results.length) {
-            throw new Error('empty results');
+            throw new Error('未返回精排结果');
         }
 
         // Treat missing/garbage scores as null instead of 0: llama.cpp-style backends return
@@ -1892,6 +1940,9 @@ async function rerankTexts(queryText, texts, force = false) {
         // (e.g. qwen3-reranker via llama.cpp) already return sigmoid-applied scores in [0, 1],
         // while 'logit' models (e.g. jina/BGE) return unbounded raw logits that need sigmoid.
         const numericScores = scored.map(x => x.score).filter(Number.isFinite);
+        if (!numericScores.length) {
+            throw new Error('精排结果中缺少有效分数');
+        }
         let batchMode = resolveRerankMode(String(settings.rerank_model || '').trim());
         if (batchMode === RERANK_MODE_AUTO) {
             batchMode = numericScores.length ? detectRerankModeFromScores(numericScores) : lastRerankMode;
@@ -1915,7 +1966,7 @@ async function rerankTexts(queryText, texts, force = false) {
             return b.score - a.score || a.index - b.index;
         });
 
-        ragLogEvent('rerank', 'info', `Reranked ${texts.length} docs in ${Date.now() - startedAt}ms`, {
+        ragLogEvent('rerank', 'info', `已完成 ${texts.length} 个候选的精排，耗时 ${Date.now() - startedAt} 毫秒`, {
             topScore: scored[0]?.score,
             topScorePct: formatRerankPercent(scored[0]?.score),
             scoreMode: lastRerankMode,
@@ -1930,8 +1981,8 @@ async function rerankTexts(queryText, texts, force = false) {
         if (saturated) {
             if (!rerankSaturatedWarnedOnce) {
                 rerankSaturatedWarnedOnce = true;
-                ragLogEvent('rerank', 'warn', `Reranker scores look saturated (best prob ${formatRerankPercent(scored[0]?.score)}). Absolute % is meaningless; only ordering is reliable. Check the model/template.`, { bestProb: scored[0]?.score });
-                toastr.warning('Reranker scores look saturated (near-zero). Only ordering is reliable — check the model/template.', 'Vector Storage');
+                ragLogEvent('rerank', 'warn', `精排分数接近零（最高概率 ${formatRerankPercent(scored[0]?.score)}）。绝对概率可能不可靠，请检查模型或提示模板。`, { bestProb: scored[0]?.score });
+                toastr.warning('精排分数接近零，绝对概率可能不可靠，请检查模型或提示模板。', '向量存储');
             }
         } else {
             rerankSaturatedWarnedOnce = false;
@@ -1942,12 +1993,12 @@ async function rerankTexts(queryText, texts, force = false) {
     } catch (error) {
         const isTimeout = error?.name === 'AbortError' || error?.name === 'TimeoutError';
         const reason = isTimeout
-            ? `timed out after ${timeoutMs}ms (lower Recall count / truncations, or raise the timeout)`
+            ? `请求在 ${timeoutMs} 毫秒后超时（请减少候选召回数或截断长度，或延长超时时间）`
             : String(error?.message || error);
         console.error('Vectors: Reranker failed, falling back to vector order', error);
-        ragLogEvent('rerank', 'warn', `Reranker failed: ${reason}. Falling back to vector order.`);
+        ragLogEvent('rerank', 'warn', `精排失败：${reason}。已回退到向量排序。`);
         if (!rerankWarnedOnce) {
-            toastr.warning(`Reranker failed (${reason}). Using embedding order instead.`, 'Vector Storage');
+            toastr.warning(`精排失败（${reason}），已回退到向量排序。`, '向量存储');
             rerankWarnedOnce = true;
         }
         return originalOrder;
@@ -1967,12 +2018,13 @@ async function testRerankerConnection() {
             'The Eiffel Tower is located in Paris.',
         ], true);
         const ms = Date.now() - startedAt;
+        const modeLabel = lastRerankMode === RERANK_MODE_PROBABILITY ? '概率' : '原始分数';
         const topText = ordered[0]?.score !== null
-            ? `top score ${formatRawScore(ordered[0].score)} (${formatRerankPercent(ordered[0].score)}, ${lastRerankMode} mode)`
-            : 'no scores returned';
-        return { ok: ordered[0]?.score !== null, message: `Reranker responded in ${ms}ms (${topText})`, ms };
+            ? `最高分 ${formatRawScore(ordered[0].score)}，相关概率 ${formatRerankPercent(ordered[0].score)}，${modeLabel}模式`
+            : '未返回分数';
+        return { ok: ordered[0]?.score !== null, message: `精排器响应耗时 ${ms} 毫秒（${topText}）`, ms };
     } catch (error) {
-        return { ok: false, message: `Reranker test failed: ${error?.message || error}`, ms: Date.now() - startedAt };
+        return { ok: false, message: `精排器测试失败：${error?.message || error}`, ms: Date.now() - startedAt };
     }
 }
 
@@ -2070,6 +2122,7 @@ function toggleSettings() {
     $('#vectors_chats_settings').toggle(!!settings.enabled_chats);
     $('#vectors_world_info_settings').toggle(!!settings.enabled_world_info);
     $('#vectors_rerank_settings').toggle(!!settings.rerank_enabled);
+    syncRerankScoreModeSelect(settings.rerank_model);
     $('#together_vectorsModel').toggle(settings.source === 'togetherai');
     $('#openai_vectorsModel').toggle(settings.source === 'openai');
     $('#electronhub_vectorsModel').toggle(settings.source === 'electronhub');
@@ -2820,14 +2873,15 @@ async function activateWorldInfo(chat) {
         }
 
         const rerankedOrder = await rerankTexts(queryText, pooledTexts);
-        reportCandidates = rerankedOrder.map((entry, rank) => ({
-            rank: rank,
+        const selectedOrder = selectRerankedCandidates(rerankedOrder, settings.max_entries);
+        reportCandidates = selectedOrder.map(entry => ({
+            rank: entry.rank,
             rerankScore: entry.score,
-            inserted: rank < settings.max_entries,
-            reason: rank < settings.max_entries ? '' : 'final count cut',
+            inserted: entry.inserted,
+            reason: entry.reason,
             text: String(pooledTexts[entry.index] ?? '').slice(0, RAG_LOG_PREVIEW_LENGTH),
         }));
-        activatedHashes = rerankedOrder.slice(0, settings.max_entries).map(entry => pooledHashes[entry.index]);
+        activatedHashes = selectedOrder.filter(entry => entry.inserted).map(entry => pooledHashes[entry.index]);
     } else {
         activatedHashes = Object.values(queryResults).flatMap(x => x.hashes).filter(onlyUnique);
         reportCandidates = [];
@@ -2841,7 +2895,7 @@ async function activateWorldInfo(chat) {
         threshold: recallThreshold ?? settings.score_threshold,
         reranked: shouldRerank(),
         tookMs: Date.now() - startedAt,
-        finalCount: Math.min(activatedHashes.length, shouldRerank() ? settings.max_entries : activatedHashes.length),
+        finalCount: activatedHashes.length,
         filteredByThreshold: [],
         candidates: reportCandidates,
     });
@@ -3213,6 +3267,22 @@ jQuery(async () => {
     });
     $('#vectors_rerank_score_mode').val(getRerankScoreModeSetting(settings.rerank_model)).on('change', () => {
         setRerankScoreModeSetting(settings.rerank_model, String($('#vectors_rerank_score_mode').val() || 'auto'));
+        syncRerankScoreModeSelect(settings.rerank_model);
+    });
+    $('#vectors_rerank_probability_threshold').val(getRerankProbabilityThreshold()).on('input', function () {
+        if (this.value === '' || !this.checkValidity()) {
+            return;
+        }
+        settings.rerank_probability_threshold = Number(this.value);
+        Object.assign(extension_settings.vectors, settings);
+        saveSettingsDebounced();
+    }).on('blur', function () {
+        this.value = getRerankProbabilityThreshold();
+    });
+    $('#vectors_rerank_ignore_max_entries').prop('checked', settings.rerank_ignore_max_entries).on('input', () => {
+        settings.rerank_ignore_max_entries = !!$('#vectors_rerank_ignore_max_entries').prop('checked');
+        Object.assign(extension_settings.vectors, settings);
+        saveSettingsDebounced();
     });
     $('#vectors_rerank_recall').val(settings.rerank_recall).on('input', () => {
         settings.rerank_recall = Number($('#vectors_rerank_recall').val());
@@ -3245,11 +3315,11 @@ jQuery(async () => {
         try {
             const result = await testRerankerConnection();
             if (result.ok) {
-                toastr.success(result.message, 'Reranker Test');
-                ragLogEvent('rerank', 'info', `Connection test OK`, { ms: result.ms });
+                toastr.success(result.message, '精排器测试');
+                ragLogEvent('rerank', 'info', '连接测试成功', { ms: result.ms });
             } else {
-                toastr.error(result.message, 'Reranker Test');
-                ragLogEvent('rerank', 'error', `Connection test failed: ${result.message}`);
+                toastr.error(result.message, '精排器测试');
+                ragLogEvent('rerank', 'error', `连接测试失败：${result.message}`);
             }
         } finally {
             button.removeClass('busy');

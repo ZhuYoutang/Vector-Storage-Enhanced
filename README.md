@@ -22,7 +22,7 @@
 ② 精排：POST {rerank_url}/v1/rerank （本地 llama.cpp / 云端均可，CPU 友好）
    │
    ▼
-③ 截断：按各路径原有数量设置取前 N 条注入上下文
+③ 筛选：概率模式下先按最低概率过滤，再按各路径数量设置取前 N 条；可取消数量上限
 ```
 
 开启后，原有的数量设置含义变为「最终保留数」：
@@ -45,16 +45,21 @@ llama-server -m bge-reranker-v2-m3-Q8_0.gguf --reranking --port 8080
 - `bge-reranker-v2-m3`（~600MB，多语言，社区口碑最好）
 - `Qwen3-Reranker-0.6B`（与 Qwen3 系列同门）
 
-设置面板中填入 Endpoint URL（如 `http://127.0.0.1:8080`），点 **Test Reranker** 验证连通性。任何兼容 `/v1/rerank` 格式的后端均可使用（llama.cpp / SiliconFlow / Jina / TEI 等）。
+设置面板中填入精排服务地址（如 `http://127.0.0.1:8080`），点 **测试精排器** 验证连通性。任何兼容 `/v1/rerank` 格式的后端均可使用（llama.cpp / SiliconFlow / Jina / TEI 等）。
 
 参数说明：
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
-| Recall count | 30 | 大海选数量，越大召回越保险，CPU 耗时略增 |
-| Ignore score threshold | ✓ | 海选阶段无视向量阈值，让 reranker 决定去留 |
-| Query truncation | 2000 字符 | 送入 reranker 前截断查询文本 |
-| API key | 空 | 可选 Bearer token |
+| 候选召回数 | 30 | 大海选数量，越大召回越保险，CPU 耗时略增 |
+| 召回时忽略向量分数阈值 | ✓ | 海选阶段无视向量阈值，让 reranker 决定去留 |
+| 分数类型（Score scale） | 自动检测 | 可选原始分数（Logits）或概率（Probabilities），按模型 ID 保存 |
+| 最低注入概率 | 0 | 仅手动选择概率类型时生效；取值 0–1，`0.5` 表示仅保留概率 ≥50% 的候选 |
+| 忽略最大条目数 | 关闭 | 仅手动选择概率类型时生效；开启后注入本轮召回中所有达标候选，仍受候选召回数限制 |
+| 查询截断长度 | 2000 字符 | 送入 reranker 前截断查询文本 |
+| API 密钥 | 空 | 可选 Bearer token |
+
+例如：将分数类型设为 **概率（Probabilities）**、最低注入概率设为 **0.5**，再勾选 **忽略最大条目数**，聊天、文件、Data Bank 和世界书都会保留本轮召回中概率大于或等于 50% 的候选。未勾选时，达标候选还会受各路径原有数量上限约束。自动检测和 Logits 类型不启用这两个选项。
 
 **降级保护**：rerank 服务不可用时自动回退到原始向量排序，仅提示一次，不阻塞生成。
 
@@ -93,4 +98,10 @@ settings.html   # 设置面板 UI
 style.css       # 样式（召回消息标记 + 诊断面板）
 webllm.js       # WebLLM 支持（继承自官方）
 manifest.json   # 扩展清单
+```
+
+运行精排注入回归测试（使用 Node.js 内置测试工具，无需安装依赖）：
+
+```bash
+node --experimental-vm-modules --test tests/reranker.test.cjs
 ```

@@ -541,94 +541,105 @@
             <hr>
 
             <h4>
-                Reranker (second-pass ranking)
+                精排器（Reranker，二次排序）
             </h4>
-            <label class="checkbox_label" for="vectors_rerank_enabled" title="Over-fetch candidates with the embedding model, then re-rank them with a cross-encoder for much better precision.">
+            <label class="checkbox_label" for="vectors_rerank_enabled" title="先用向量模型召回较多候选，再用精排模型进行二次排序，提高检索准确度。">
                 <input id="vectors_rerank_enabled" type="checkbox" class="checkbox">
                 <span>
-                    Enable Reranker
+                    启用精排器
                 </span>
             </label>
             <div id="vectors_rerank_settings" class="marginTopBot5">
                 <label for="vectors_rerank_url">
-                    <small data-i18n="Reranker Endpoint URL">Reranker endpoint URL (/v1/rerank)</small>
+                    <small>精排服务地址（/v1/rerank）</small>
                 </label>
                 <input id="vectors_rerank_url" class="text_pole" type="text" placeholder="http://127.0.0.1:8080" />
                 <div class="flex-container">
                     <div class="flex1">
                         <label for="vectors_rerank_model">
-                            <small data-i18n="Reranker Model">Model ID (optional)</small>
+                            <small>模型 ID（可选）</small>
                         </label>
                         <input id="vectors_rerank_model" class="text_pole" type="text" placeholder="bge-reranker-v2-m3" />
                     </div>
-                    <div class="flex1" title="How many candidates to over-fetch from vector search before reranking. Higher = safer recall, more CPU time. The per-path 'final count' settings decide how many survive.">
+                    <div class="flex1" title="精排前从向量检索中召回的候选数量。数量越多，召回越充分，计算耗时也越长。最终注入数量由各检索路径的数量设置和概率筛选选项决定。">
                         <label for="vectors_rerank_recall">
-                            <small data-i18n="Recall Count">Recall count (wide fetch)</small>
+                            <small>候选召回数（海选数量）</small>
                         </label>
                         <input id="vectors_rerank_recall" class="text_pole widthUnset" type="number" min="2" max="999" />
                     </div>
                 </div>
                 <div class="flex-container">
-                    <div class="flex1" title="How the /v1/rerank endpoint reports relevance. Auto-detect inspects the returned scores (all within 0..1 = already probabilities, e.g. qwen3-reranker via llama.cpp; otherwise raw logits, e.g. jina/BGE). Pick a fixed mode if Auto guesses wrong — it is remembered per model id.">
+                    <div class="flex1" title="指定精排接口返回的分数类型。自动检测会参考模型名称和分数范围：0–1 通常表示概率，其他范围表示原始分数。若识别不正确，可手动选择；该选择会按模型 ID 保存。">
                         <label for="vectors_rerank_score_mode">
-                            <small data-i18n="Rerank Score Scale">Score scale</small>
+                            <small>分数类型（Score scale）</small>
                         </label>
                         <select id="vectors_rerank_score_mode" class="text_pole">
-                            <option value="auto">Auto-detect</option>
-                            <option value="logit">Logits (sigmoid, jina/BGE)</option>
-                            <option value="probability">Probabilities (0–1, qwen3)</option>
+                            <option value="auto">自动检测</option>
+                            <option value="logit">原始分数（Logits，经 sigmoid 转换，jina/BGE）</option>
+                            <option value="probability">概率（Probabilities，0–1，qwen3）</option>
                         </select>
                     </div>
-                    <div class="flex1" title="Leave Auto-detect enabled unless it misreads your model. qwen3-reranker and other sigmoid-output models already return 0..1 probabilities; jina/BGE/GT E return raw logits that are converted with the logistic function.">
+                    <div class="flex1" title="通常可使用自动检测。qwen3-reranker 等模型直接输出 0–1 概率；jina/BGE/GTE 等模型输出原始分数，需要通过 sigmoid 函数转换。需要按概率筛选时，请手动选择“概率”。">
                         <label>
-                            <small>Hint</small>
+                            <small>选择提示</small>
                         </label>
-                        <div class="vectors_rerank_mode_hint">Auto: qwen3 → 0–1, jina/BGE → logit</div>
+                        <div class="vectors_rerank_mode_hint">自动检测：qwen3 → 概率，jina/BGE → 原始分数</div>
                     </div>
                 </div>
+                <div id="vectors_rerank_probability_settings" class="marginTopBot5" style="display: none;">
+                    <label for="vectors_rerank_probability_threshold" title="输入 0–1 之间的数值。只有概率大于或等于此值的候选才可注入，例如 0.5 表示至少 50%；0 表示不额外过滤有效概率。">
+                        <small>最低注入概率（0–1）</small>
+                    </label>
+                    <input id="vectors_rerank_probability_threshold" class="text_pole widthUnset" type="number" min="0" max="1" step="any" placeholder="例如：0.5" />
+                    <label class="checkbox_label" for="vectors_rerank_ignore_max_entries" title="忽略聊天插入数、文件与 Data Bank 的检索块数、世界书的最大条目数，注入本轮召回中所有达到最低概率的候选。仍受候选召回数限制。">
+                        <input id="vectors_rerank_ignore_max_entries" type="checkbox" class="checkbox">
+                        <span>忽略最大条目数，注入所有达到最低概率的候选</span>
+                    </label>
+                    <small class="vectors_rerank_mode_hint">仅手动选择“概率”时生效。0.5 = 50%，包含恰好等于阈值的候选；取消数量上限后仍受候选召回数限制。</small>
+                </div>
                 <div class="flex-container">
-                    <div class="flex1" title="Optional API key, sent as a Bearer token. Leave empty for local servers.">
+                    <div class="flex1" title="可选，以 Bearer token 形式发送。本地服务通常可留空。">
                         <label for="vectors_rerank_key">
-                            <small data-i18n="API Key">API key (optional)</small>
+                            <small>API 密钥（可选）</small>
                         </label>
-                        <input id="vectors_rerank_key" class="text_pole" type="password" placeholder="(None)" />
+                        <input id="vectors_rerank_key" class="text_pole" type="password" placeholder="留空表示不使用" />
                     </div>
-                    <div class="flex1" title="The retrieval query can be very long. Truncate it to this many characters before sending to the reranker.">
+                    <div class="flex1" title="检索查询可能很长。发送给精排器前，将查询截断到此字符数。">
                         <label for="vectors_rerank_query_max_chars">
-                            <small data-i18n="Query Truncation">Query truncation (chars)</small>
+                            <small>查询截断长度（字符）</small>
                         </label>
                         <input id="vectors_rerank_query_max_chars" class="text_pole widthUnset" type="number" min="100" max="32000" step="100" />
                     </div>
                 </div>
                 <div class="flex-container">
-                    <div class="flex1" title="Chat-path candidates are full messages and can be huge. Truncate each candidate to this many characters before sending to the reranker. This is the main lever against slow CPU reranking.">
+                    <div class="flex1" title="聊天候选可能包含很长的完整消息。发送前将每个候选截断到此字符数，可明显降低 CPU 精排耗时。">
                         <label for="vectors_rerank_doc_max_chars">
-                            <small data-i18n="Doc Truncation">Doc truncation (chars)</small>
+                            <small>候选文本截断长度（字符）</small>
                         </label>
                         <input id="vectors_rerank_doc_max_chars" class="text_pole widthUnset" type="number" min="100" max="32000" step="100" />
                     </div>
-                    <div class="flex1" title="Give up on the rerank call after this long (ms) and fall back to embedding order. Prevents a slow/overloaded server from stalling generation.">
+                    <div class="flex1" title="精排请求超过此时间后，回退到向量排序，避免服务过慢或过载时阻塞生成。">
                         <label for="vectors_rerank_timeout_ms">
-                            <small data-i18n="Rerank Timeout">Timeout (ms)</small>
+                            <small>超时时间（毫秒）</small>
                         </label>
                         <input id="vectors_rerank_timeout_ms" class="text_pole widthUnset" type="number" min="3000" max="600000" step="1000" />
                     </div>
                 </div>
-                <label class="checkbox_label" for="vectors_rerank_ignore_threshold" title="Recommended: during the wide-recall phase, bypass the embedding score threshold entirely and let the reranker decide what matters.">
+                <label class="checkbox_label" for="vectors_rerank_ignore_threshold" title="建议开启：海选阶段忽略向量相似度阈值，交由精排器决定哪些候选应当保留。这与精排后的最低注入概率是两个独立设置。">
                     <input id="vectors_rerank_ignore_threshold" type="checkbox" class="checkbox">
                     <span>
-                        Ignore score threshold while recalling
+                        召回时忽略向量分数阈值
                     </span>
                 </label>
                 <div class="flex-container">
-                    <div id="vectors_rerank_test" class="menu_button menu_button_icon" title="Send a small test job to the reranker endpoint and show the returned scores.">
+                    <div id="vectors_rerank_test" class="menu_button menu_button_icon" title="向精排服务发送少量测试文本，并显示返回分数。">
                         <span>
-                            Test Reranker
+                            测试精排器
                         </span>
                     </div>
                 </div>
                 <small>
-                    Local CPU example: <code>llama-server -m bge-reranker-v2-m3-Q8_0.gguf --reranking --port 8080</code>
+                    本地 CPU 启动示例：<code>llama-server -m bge-reranker-v2-m3-Q8_0.gguf --reranking --port 8080</code>
                 </small>
             </div>
 
